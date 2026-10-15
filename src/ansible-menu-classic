@@ -1,0 +1,1673 @@
+from acc_config import load_config, expand_path
+#!/usr/bin/env python3
+"""Ansible Control Center v6.1 — Fedora operations console.
+Authors: Jeff Swenson and ChatGPT Pro / OpenAI GPT-6
+Version: 6.1.0-candidate1
+Description: Existing menu and safety controls with read-only v6 integrations.
+Requirements: Fedora, Python 3, Ansible; kubectl for Kubernetes views.
+Example: python3 ansible-menu-v6.1.py --version
+Changelog: Added checks 26-35; blocked generic control-plane dist upgrades.
+Logging: Existing history.log; new exports in private ACC state directory.
+"""
+import base64
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import datetime
+import time
+import shlex
+import shutil
+import re
+import ipaddress
+
+
+from acc_config import load_config, ACCConfigError
+from acc_node_policy import authorize_worker
+
+HOME = Path.home()
+INV = HOME / 'ansible/inventory/hosts.ini'
+PLAYBOOK = HOME / 'ansible/playbooks/k3s-prerequisites.yml'
+KEY = HOME / '.ssh/ansible_k3s'
+BASE = ['-i', str(INV), '--private-key', str(KEY)]
+HISTORY = HOME / '.local/state/ansible-control-center/history.log'
+
+TTY = sys.stdout.isatty() and os.environ.get('NO_COLOR') is None
+
+def color(s, c):
+    return f'\033[{c}m{s}\033[0m' if TTY else s
+
+def run(args):
+    started=datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds')
+    try:
+        code=subprocess.run(args, check=False).returncode
+    except FileNotFoundError as e:
+        print(f'Command unavailable: {e}'); code=127
+    try:
+        HISTORY.parent.mkdir(parents=True,exist_ok=True)
+        with HISTORY.open('a') as f:
+            f.write(f'{started} | exit={code} | {shlex.join([str(x) for x in args])}\n')
+    except OSError: pass
+    return code
+
+def pause():
+    input('\nPress Enter to continue...')
+
+# Data is retrieved by Ansible over SSH, never by a second independent SSH client.
+# No sudo is required to collect status.
+REMOTE = r'''
+import glob,json,os,shutil,socket,subprocess,time
+
+def cmd(args,timeout=12):
+    try:
+        r=subprocess.run(args,capture_output=True,text=True,timeout=timeout)
+        return r.stdout.strip() if r.returncode == 0 else ''
+    except Exception: return ''
+
+def mem():
+    d={}
+    try:
+        for line in open('/proc/meminfo'):
+            k,v=line.split(':',1); d[k]=int(v.split()[0])
+        return round((d['MemTotal']-d['MemAvailable'])/d['MemTotal']*100)
+    except Exception: return None
+
+def cpu():
+    def tick():
+        a=list(map(int,open('/proc/stat').readline().split()[1:]))
+        return sum(a),a[3]+a[4]
+    try:
+        t1,i1=tick(); time.sleep(0.25); t2,i2=tick()
+        return round(100*(1-(i2-i1)/(t2-t1))) if t2>t1 else 0
+    except Exception: return None
+
+def temp():
+    vals=[]
+    for p in glob.glob('/sys/class/hwmon/hwmon*/temp*_input'):
+        try:
+            value=int(open(p).read())/1000
+            if 5<=value<=110: vals.append(value)
+        except Exception: pass
+    if not vals:
+        for p in glob.glob('/sys/class/thermal/thermal_zone*/temp'):
+            try:
+                value=int(open(p).read())/1000
+                if 5<=value<=110: vals.append(value)
+            except Exception: pass
+    return round(max(vals)) if vals else None
+
+def hardware():
+    cpu_model='-'
+    try:
+        for line in open('/proc/cpuinfo'):
+            if line.startswith('model name'):
+                cpu_model=line.split(':',1)[1].strip(); break
+    except Exception: pass
+    memory=None
+    try:
+        for line in open('/proc/meminfo'):
+            if line.startswith('MemTotal:'):
+                memory=round(int(line.split()[1])/1048576,1);break
+    except Exception: pass
+    disks=[]
+    try:
+        data=json.loads(cmd(['lsblk','-J','-b','-d','-o','NAME,SIZE,TYPE,TRAN,MODEL'],8))
+        for item in data.get('blockdevices',[]):
+            if item.get('type')=='disk':
+                disks.append({'name':item.get('name'), 'size_gib':round(int(item.get('size') or 0)/1073741824,1),
+                              'transport':item.get('tran') or '-', 'model':(item.get('model') or '').strip()})
+    except Exception: pass
+    interfaces=[]
+    try:
+        address_map={}
+        for item in json.loads(cmd(['ip','-j','-4','addr','show'],8)):
+            address_map[item.get('ifname')]=[a['local'] for a in item.get('addr_info',[]) if 'local' in a]
+        for name in sorted(os.listdir('/sys/class/net')):
+            if name=='lo':continue
+            path='/sys/class/net/'+name
+            try: state=open(path+'/operstate').read().strip()
+            except Exception: state='unknown'
+            try: speed=open(path+'/speed').read().strip()
+            except Exception: speed='-'
+            interfaces.append({'name':name,'state':state,'speed_mbps':speed,'ipv4':address_map.get(name,[])})
+    except Exception: pass
+    return {'cpu_model':cpu_model,'cores':os.cpu_count(),'ram_gib':memory,'disks':disks,'interfaces':interfaces}
+
+def service(name):
+    try:
+        p=subprocess.run(['systemctl','is-active',name],capture_output=True,text=True,timeout=4)
+        return p.stdout.strip() or 'unknown'
+    except Exception:return 'unknown'
+
+def kube_status():
+    # Read-only local service and process detection; does not require sudo.
+    installed = bool(cmd(['snap','list','microk8s'],5))
+    if not installed:
+        return {'role':'not installed','service':'-', 'api':'-', 'cluster_ready':None, 'cluster_nodes':None, 'pods_healthy':None, 'pods_total':None, 'ha':None}
+    active = service('snap.microk8s.daemon-kubelite')
+    if active != 'active':
+        return {'role':'stopped','service':active,'api':'-', 'cluster_ready':None,'cluster_nodes':None,'pods_healthy':None,'pods_total':None,'ha':None}
+    result={'role':'MicroK8s','service':active,'api':'restricted','cluster_ready':None,'cluster_nodes':None,'pods_healthy':None,'pods_total':None,'ha':None}
+    # Attempt unprivileged API access only. Many installations restrict this
+    # to the microk8s group; no sudo prompt in the SSH-login dashboard.
+    try:
+        p=subprocess.run(['microk8s','kubectl','get','nodes','-o','json','--request-timeout=4s'],capture_output=True,text=True,timeout=7)
+        if p.returncode==0:
+            items=json.loads(p.stdout).get('items',[])
+            result['cluster_nodes']=len(items)
+            result['cluster_ready']=sum(any(c.get('type')=='Ready' and c.get('status')=='True' for c in x.get('status',{}).get('conditions',[])) for x in items)
+            result['api']='ok'
+            q=subprocess.run(['microk8s','kubectl','get','pods','-A','-o','json','--request-timeout=4s'],capture_output=True,text=True,timeout=7)
+            if q.returncode==0:
+                pods=json.loads(q.stdout).get('items',[])
+                result['pods_total']=len(pods)
+                result['pods_healthy']=sum(x.get('status',{}).get('phase') in ('Running','Succeeded') for x in pods)
+    except Exception:pass
+    # HA from microk8s status can be accessed only if user is permitted.
+    try:
+        h=subprocess.run(['microk8s','status','--wait-ready'],capture_output=True,text=True,timeout=7)
+        if h.returncode==0:
+            result['masters']=[]
+            for line in h.stdout.splitlines():
+                if line.strip().startswith('high-availability:'):
+                    result['ha']=line.split(':',1)[1].strip()
+                if line.strip().startswith('datastore master nodes:'):
+                    result['masters']=line.split(':',1)[1].strip().split()
+    except Exception:pass
+    return result
+
+def updates():
+    if not shutil.which('apt'): return None
+    try:
+        r=subprocess.run(['apt','list','--upgradable'],capture_output=True,text=True,timeout=12)
+        return sum(1 for l in r.stdout.splitlines() if '/' in l and not l.startswith('Listing')) if r.returncode==0 else None
+    except Exception: return None
+
+def security_info():
+    return {
+      'ufw':(cmd(['ufw','status'],3).splitlines() or ['unavailable'])[0] if shutil.which('ufw') else 'unavailable',
+      'apparmor':cmd(['systemctl','is-active','apparmor'],3) or 'unknown',
+      'ssh':cmd(['systemctl','is-active','ssh'],3) or cmd(['systemctl','is-active','sshd'],3) or 'unknown',
+      'auto_updates':cmd(['systemctl','is-enabled','apt-daily-upgrade.timer'],3) or 'unknown',
+    }
+
+def network_info():
+    return {'default_route':cmd(['ip','-4','route','show','default'],3),
+            'dns':cmd(['resolvectl','dns'],3)[:250] if shutil.which('resolvectl') else '-',
+            'addresses':cmd(['hostname','-I'],3)}
+
+def disk_health():
+    # No root access required; SMART details need smartctl + privileges.
+    return {'smartctl_installed':bool(shutil.which('smartctl')),
+            'root_fs':cmd(['findmnt','-n','-o','SOURCE,FSTYPE','/'],3)}
+
+try:
+    disk=shutil.disk_usage('/')
+    d={
+        'hostname':socket.gethostname(),
+        'ip':next(iter(cmd(['hostname','-I']).split()), '-'),
+        'cpu':cpu(), 'ram':mem(),
+        'disk':round(100*disk.used/disk.total),
+        'temp':temp(),
+        'updates':updates(),
+        'uptime':round(float(open('/proc/uptime').read().split()[0])/3600,1),
+        'microk8s':kube_status(),
+        'reboot':os.path.exists('/run/reboot-required') or os.path.exists('/var/run/reboot-required'),
+        'hardware':hardware(),
+        'security': security_info(),
+        'network': network_info(),
+        'disk_health': disk_health(),
+    }
+    print(json.dumps(d,separators=(',',':')))
+except Exception as e:
+    print(json.dumps({'error':str(e)}))
+'''
+
+def inventory_hosts():
+    p=subprocess.run(['ansible-inventory','-i',str(INV),'--list'],capture_output=True,text=True)
+    try:
+        d=json.loads(p.stdout)
+        return {k:v for k,v in d.get('_meta',{}).get('hostvars',{}).items()}
+    except (ValueError,KeyError): return {}
+
+def hosts():
+    p=subprocess.run(['ansible','all',*BASE,'--list-hosts'],capture_output=True,text=True)
+    if p.returncode:
+        print(p.stderr or p.stdout)
+        return []
+    return [s.strip() for s in p.stdout.splitlines()[1:] if s.strip()]
+
+def parse_ansible_status_output(output, known):
+    """Parse marked base64 payloads; never infer SSH failure from a parse error."""
+    results = {}
+    for host in known:
+        # Ansible one-line output changes slightly across core versions:
+        # host | CHANGED | rc=0 | (stdout) >> ACC_JSON_B64=...
+        # Match on the explicit marker rather than the callback's >> syntax.
+        host_lines = [line for line in output.splitlines()
+                      if re.match(r'^' + re.escape(host) + r'\s+\|', line)]
+        entries = '\n'.join(host_lines)
+        marker = re.search(r'ACC_JSON_B64=([A-Za-z0-9+/=]+)', entries)
+        if marker:
+            try:
+                decoded = base64.b64decode(marker.group(1), validate=True).decode('utf-8')
+                item = json.loads(decoded)
+                if isinstance(item, dict):
+                    results[host] = item
+                else:
+                    results[host] = {'error': 'Remote returned unexpected data type'}
+            except (ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                results[host] = {'error': 'Remote status decode failed: ' + str(exc)}
+        elif 'UNREACHABLE!' in entries:
+            results[host] = {'error': 'SSH unreachable: ' + entries[-160:]}
+        elif 'FAILED!' in entries:
+            results[host] = {'error': 'Status command failed: ' + entries[-160:]}
+        else:
+            results[host] = {'error': 'No status marker returned (check Ansible output)'}
+    return results
+
+
+def collect():
+    known=hosts()
+    if not known:return [],{}
+    payload=base64.b64encode(REMOTE.encode()).decode()
+    # The marker is deliberately outside the encoded JSON, allowing parsing
+    # regardless of changes to Ansible's one-line callback layout.
+    script=(f"printf ACC_JSON_B64=; "
+            f"python3 -c 'exec(__import__(\"base64\").b64decode(\"{payload}\"))' | base64 -w0")
+    print('\nGathering live status from inventory hosts...')
+    p=subprocess.run(['ansible','all',*BASE,'-m','shell','-a',script,'-o','-f','15'],
+                     capture_output=True,text=True)
+    results=parse_ansible_status_output(p.stdout, known)
+    if p.stderr and '--tree' in p.stderr:
+        print('Note: an Ansible callback is still configured with deprecated --tree.')
+    return known,results
+
+def ha_summary(known, results):
+    """Cluster-level data from accessible control-plane APIs; never infer HA from node count."""
+    kubes=[]
+    for host in known:
+        data=results.get(host,{})
+        kube=data.get('microk8s') or {}
+        if kube.get('api')=='ok' and kube.get('cluster_nodes') is not None:
+            kubes.append((host,kube))
+    if not kubes:
+        print(color(' CLUSTER: UNKNOWN (no authorized Kubernetes API query succeeded)', '33'))
+        return
+    # Prefer the fullest successful API response; if probes disagree, flag it.
+    host,k=max(kubes,key=lambda hk:(hk[1].get('cluster_nodes') or 0, hk[1].get('pods_total') or 0))
+    ready,total=k.get('cluster_ready'),k.get('cluster_nodes')
+    healthy,pods=k.get('pods_healthy'),k.get('pods_total')
+    has=[(h,x.get('ha'),x.get('masters',[])) for h,x in kubes if x.get('ha') is not None]
+    verified=next(((h,v,m) for h,v,m in has if v=='yes' and len(m)>=3),None)
+    if verified:
+        ha='YES'; masters=f'{len(verified[2])} datastore masters'
+    elif has:
+        ha=' / '.join(sorted(set(x[1] for x in has)))
+        masters='datastore members not confirmed'
+    else:
+        ha='UNKNOWN (insufficient permissions)'; masters='not verified'
+    issues=[]
+    if ready is not None and total is not None and ready!=total:issues.append(f'{total-ready} node(s) NotReady')
+    if pods is not None and healthy is not None and healthy!=pods:issues.append(f'{pods-healthy} pod(s) not Running/Succeeded')
+    if ha!='YES':issues.append('HA not verified' if ha.startswith('UNKNOWN') else 'HA not healthy/confirmed')
+    if total!=5:issues.append(f'expected 5 nodes, saw {total}')
+    mismatches=[h for h in known if 'error' not in results.get(h,{}) and results[h].get('hostname')!=h]
+    if mismatches:issues.append('inventory name mismatch: '+', '.join(mismatches))
+    unreachable=[h for h in known if 'error' in results.get(h,{})]
+    if unreachable:issues.append('collection errors: '+', '.join(unreachable))
+    disagreements=[h for h,x in kubes if x.get('cluster_nodes')!=total or x.get('cluster_ready')!=ready]
+    if disagreements:issues.append('API results inconsistent: '+', '.join(disagreements))
+    print(' MICROK8S CLUSTER HEALTH (queried via '+host+')')
+    print(f' Nodes: {ready}/{total} Ready  |  Pods: {healthy if healthy is not None else "?"}/{pods if pods is not None else "?"} Running/Succeeded  |  HA: {ha}  |  {masters}')
+    if issues:
+        print(color(' ALERTS: ' + '; '.join(issues), '33'))
+    else:
+        print(color(' HEALTHY: no issues detected in collected snapshot', '32'))
+    print(' Note: API access and quorum may change; verify failover separately.')
+
+def backup_health():
+    path = Path(expand_path(load_config()['backups']['directory']))
+    if not path.exists():
+        print(' BACKUP: NOT CONFIGURED / no verified scheduled run yet')
+        return
+    try:
+        v=json.loads(path.read_text())
+        checked=datetime.datetime.fromisoformat(v['checked_at'])
+        age=datetime.datetime.now(datetime.timezone.utc)-checked
+        hours=max(0,age.total_seconds()/3600)
+        state=v.get('status','unknown').upper()
+        archive=Path(v.get('archive',''))
+        if state=='OK' and (not archive.is_file() or not Path(str(archive)+'.sha256').is_file()):
+            state='MISSING FILE'
+        if state=='OK' and hours>36:
+            state='STALE'
+        size=f'{archive.stat().st_size/1024:.0f} KiB' if archive.is_file() else '-'
+        col='32' if state=='OK' else '33'
+        print(' BACKUP: '+color(state,col)+f' | {hours:.1f}h since last attempt | {size} | {archive.name if archive.is_file() else "-"}')
+        if state!='OK': print(' BACKUP ALERT: '+v.get('message','Check backup service logs'))
+    except (OSError,ValueError,KeyError,TypeError) as e:
+        print(' BACKUP: STATUS ERROR ('+str(e)+')')
+
+def dashboard(details=False):
+    if not details:
+        return command_dashboard()
+    known,results=collect()
+    if not known:return
+    width=119
+    print('\n'+'='*width)
+    print(' ANSIBLE CONTROL CENTER | MicroK8s HA cluster / Ubuntu nodes')
+    print('='*width)
+    print(f"{'INVENTORY':<11}{'HOSTNAME':<13}{'IP':<17}{'STATE':<11}{'CPU':>5}{'RAM':>6}{'DISK':>6}{'TEMP':>7}{'UPD':>6}{'REBOOT':>9}{'MICROK8S':>13}{'API':>12}")
+    print('-'*width)
+    for host in known:
+        d=results[host]
+        if 'error' in d:
+            # Ansible UNREACHABLE doesn't prove the physical node is offline.
+            print(f"{host:<11}{'-':<13}{'-':<17}"+color(f"{'ERROR':<11}",'31')+f" {str(d['error'])[:65]}")
+            continue
+        mismatch=d['hostname']!=host
+        hn=(d['hostname']+(' !' if mismatch else ''))[:12]
+        def pct(v):return f'{v}%' if v is not None else '-'
+        k=d.get('microk8s') or {}
+        reboot='YES' if d.get('reboot') else 'no'
+        tp=d.get('temp')
+        api=k.get('api','-')
+        print(f"{host:<11}{hn:<13}{d['ip']:<17}"+color(f"{'ONLINE':<11}",'32')+f"{pct(d.get('cpu')):>5}{pct(d.get('ram')):>6}{pct(d.get('disk')):>6}{(str(tp)+'C') if tp is not None else '-':>7}{str(d.get('updates'                        )) if d.get('updates') is not None else '-':>6}{reboot:>9}{k.get('role','-')[:13]:>13}{api:>12}")
+    print('-'*width)
+    print('! = inventory/hostname mismatch  |  API restricted = kubectl requires MicroK8s permissions')
+    print('ERROR may indicate an SSH or collection problem, not a server outage. Snapshot is read-only.')
+    ha_summary(known,results)
+    backup_health()
+    print('For a sudo-backed HA audit, select menu option 16.')
+    if details:
+        print('\nHARDWARE & MICROK8S DETAILS')
+        for host in known:
+            d=results[host]
+            print('\n'+'-'*70+'\n'+host)
+            if 'error' in d:
+                print('Unavailable:',d['error']);continue
+            h=d.get('hardware') or {}; k=d.get('microk8s') or {}
+            print(f"CPU: {h.get('cpu_model','-')} | logical CPUs: {h.get('cores','-')} | RAM: {h.get('ram_gib','-')} GiB")
+            for x in h.get('disks',[]):print(f"Disk: {x.get('name')} {x.get('size_gib')} GiB {x.get('transport')} {x.get('model')}")
+            for x in h.get('interfaces',[]):
+                if x['name'].startswith(('cali','vxlan.')):continue
+                print(f"NIC: {x.get('name')} {x.get('state')} {x.get('speed_mbps')} Mbps {', '.join(x.get('ipv4',[]))}")
+            print(f"MicroK8s: {k.get('role')} (service {k.get('service')}); API: {k.get('api')} | HA: {k.get('ha') or 'not verified'}")
+            if k.get('cluster_nodes') is not None:
+                print(f"Nodes: {k['cluster_ready']}/{k['cluster_nodes']} Ready | Pods: {k.get('pods_healthy')}/{k.get('pods_total')} healthy")
+
+
+
+# v5.1: presentation-only upgrade. All existing commands and protections remain.
+def command_dashboard():
+    """v5.2: node gauges, heuristic health scores, and local activity feed."""
+    known, results = collect()
+    if not known:
+        return
+    width = min(132, max(76, shutil.get_terminal_size(fallback=(120, 30)).columns))
+    compact = width < 105
+    interior = width - 2
+
+    def line(value='', tone=None):
+        value = str(value).replace('\n', ' ')
+        value = value[:interior-2]
+        text = ' ' + value.ljust(interior-2) + ' '
+        print('│' + (color(text, tone) if tone else text) + '│')
+
+    def divider():
+        print('├' + '─' * interior + '┤')
+
+    def gauge(value, length=10):
+        if not isinstance(value, (int, float)):
+            return '[' + '?' * length + ']'
+        v = max(0, min(100, float(value)))
+        filled = int(round(length * v / 100))
+        return '[' + '█' * filled + '░' * (length-filled) + ']'
+
+    def n(value, suffix='%'):
+        return '-' if not isinstance(value, (int, float)) else f'{value:.0f}{suffix}'
+
+    def score(d):
+        # Heuristic infrastructure score: NOT an uptime/SLA prediction.
+        if 'error' in d:
+            return 0
+        result = 100
+        for name, warning, critical, low, high in (
+            ('cpu', 70, 90, 8, 18),
+            ('ram', 75, 90, 8, 18),
+            ('disk', 75, 90, 10, 23),
+            ('temp', 70, 85, 8, 18),
+        ):
+            v=d.get(name)
+            if isinstance(v,(float,int)):
+                if v >= critical: result -= high
+                elif v >= warning: result -= low
+            else:
+                result -= 3
+        if d.get('reboot'): result -= 7
+        if d.get('hostname') and d['hostname'] != d.get('inventory_alias',d['hostname']):
+            pass  # Inventory mismatch is checked separately.
+        return max(0,result)
+
+    responsive=[]
+    alerts=[]
+    for host in known:
+        d=results.get(host,{})
+        if 'error' in d:
+            alerts.append(('CRITICAL',host+' unreachable or status unavailable'))
+            continue
+        responsive.append(host)
+        if d.get('hostname') != host:alerts.append(('WARN',host+' hostname mismatch'))
+        if d.get('reboot'):alerts.append(('WARN',host+' reboot requested'))
+        if isinstance(d.get('disk'),(int,float)) and d['disk'] >= 85:
+            alerts.append(('CRITICAL',host+' disk at '+n(d['disk'])))
+        if isinstance(d.get('ram'),(int,float)) and d['ram'] >= 90:
+            alerts.append(('CRITICAL',host+' RAM at '+n(d['ram'])))
+        if isinstance(d.get('temp'),(int,float)) and d['temp'] >= 80:
+            alerts.append(('WARN',host+' temperature at '+n(d['temp'],'°C')))
+    kubes=[(h,(results.get(h,{}).get('microk8s') or {})) for h in known]
+    valid=[(h,k) for h,k in kubes if k.get('api') == 'ok' and k.get('cluster_nodes') is not None]
+    selected=max(valid,key=lambda t: (t[1].get('cluster_nodes') or 0,t[1].get('pods_total') or 0)) if valid else None
+    k=selected[1] if selected else {}
+    ready,total=k.get('cluster_ready'),k.get('cluster_nodes')
+    pods_ok,pods_total=k.get('pods_healthy'),k.get('pods_total')
+    ha_sources=[v for _,v in valid if v.get('ha') == 'yes' and len(v.get('masters') or []) >= 3]
+    masters=len(ha_sources[0].get('masters') or []) if ha_sources else 0
+    ha=bool(ha_sources)
+    if total is None:alerts.append(('UNKNOWN','Kubernetes API metrics unavailable'))
+    elif ready != total:alerts.append(('CRITICAL','Kubernetes nodes NotReady'))
+    if pods_total is not None and pods_ok != pods_total:alerts.append(('CRITICAL','Unhealthy Kubernetes pods'))
+    if not ha:alerts.append(('CRITICAL','HA dqlite quorum not verified'))
+
+    backup_path=Path(expand_path(load_config()['backups']['directory']))
+    backup_state='NOT CONFIGURED'; backup_age='-'; backup_file='-';backup_size='-';backup_time=''
+    if backup_path.is_file():
+        try:
+            record=json.loads(backup_path.read_text())
+            bt=datetime.datetime.fromisoformat(record['checked_at'])
+            if bt.tzinfo is None: bt=bt.replace(tzinfo=datetime.timezone.utc)
+            age=max(0,(datetime.datetime.now(datetime.timezone.utc)-bt).total_seconds()/3600)
+            backup_age=f'{age:.1f}h'; backup_time=bt.astimezone().strftime('%m-%d %H:%M')
+            backup_state=str(record.get('status','UNKNOWN')).upper()
+            archive=Path(record.get('archive') or '/nonexistent')
+            if archive.is_file() and Path(str(archive)+'.sha256').is_file():
+                backup_file=archive.name
+                backup_size=f'{archive.stat().st_size/1024:.0f} KiB'
+            elif backup_state == 'OK':backup_state='MISSING FILE'
+            if backup_state == 'OK' and age > 36:backup_state='OVERDUE'
+        except (OSError,ValueError,KeyError,TypeError):backup_state='STATUS ERROR'
+    if backup_state != 'OK':alerts.append(('WARN','Backup '+backup_state))
+    label='HEALTHY' if not alerts else ('DEGRADED' if not any(s=='CRITICAL' for s,_ in alerts) else 'ATTENTION')
+
+    print('┌'+'─'*interior+'┐')
+    line('ANSIBLE CONTROL CENTER  /  OPERATIONS OVERVIEW', '1;36')
+    line('FEDORA-SERVER1  •  MicroK8s cluster  •  '+datetime.datetime.now().astimezone().strftime('%a %d %b %Y  %H:%M:%S %Z'))
+    divider()
+    headline=(f'HOSTS {len(responsive)}/{len(known)}  │  K8S {n(ready,"")}/{n(total,"")}  │  PODS {n(pods_ok,"")}/{n(pods_total,"")}  │  '
+              f'HA {"3-MASTER" if ha else "UNVERIFIED"}  │  {label}')
+    line(headline, '1;32' if label=='HEALTHY' else '1;33' if label=='DEGRADED' else '1;31')
+    divider()
+    line('NODE HEALTH  /  CPU and memory gauges represent live utilization', '1;36')
+    if compact:
+        line(f'{"NODE":<8} {"SCORE":>5} {"CPU":>5} {"CPU GAUGE":<12} {"RAM":>5} {"RAM GAUGE":<12} {"DISK":>5} {"TEMP":>5} {"UPD":>4}')
+    else:
+        line(f'{"NODE":<8} {"IP":<16} {"SCORE":>5} {"CPU":>5} {"CPU LOAD":<12} {"RAM":>5} {"RAM LOAD":<12} {"DISK":>5} {"TEMP":>6} {"UPD":>4} {"ROLE":<11}')
+    line('─'*(interior-2))
+    for host in sorted(known,key=lambda s:(int(re.search(r'\d+$',s).group()) if re.search(r'\d+$',s) else 999,s)):
+        d=results.get(host,{})
+        sc=score(d)
+        ip=str(d.get('ip','-'))
+        role=(d.get('microk8s') or {}).get('role','-')
+        if compact:
+            message=f'{host:<8} {sc:>5} {n(d.get("cpu")):>5} {gauge(d.get("cpu")):<12} {n(d.get("ram")):>5} {gauge(d.get("ram")):<12} {n(d.get("disk")):>5} {n(d.get("temp"),"C"):>5} {str(d.get("updates", "-")):>4}                        '
+        else:
+            message=f'{host:<8} {ip:<16} {sc:>5} {n(d.get("cpu")):>5} {gauge(d.get("cpu")):<12} {n(d.get("ram")):>5} {gauge(d.get("ram")):<12} {n(d.get("disk")):>5} {n(d.get("temp"),"C"):>6} {str(d.get("updates",                         "-")):>4} {role[:11]:<11}'
+        line(message, '31' if sc<60 else '33' if sc<85 else None)
+    line('Score /100 is a heuristic from host resource thresholds and reboot flags, not an SLA.')
+    divider()
+    line('BACKUP  /  off-node dqlite snapshot', '1;36')
+    line(f'{backup_state:<15} Age {backup_age:<7} Archive {backup_size:<10} {backup_file}', '32' if backup_state=='OK' else '33')
+    divider()
+    line(f'ACTIVE ALERTS  /  {len(alerts)} finding(s)', '1;32' if not alerts else '1;33')
+    if not alerts:line('No threshold violations in the current collected snapshot.')
+    for severity,message in alerts[:3]:line(f'{severity:<8} {message}', '31' if severity=='CRITICAL' else '33')
+    if len(alerts)>3:line(f'+ {len(alerts)-3} additional finding(s). See ansible-menu --alerts')
+    divider()
+    line('RECENT ACTIVITY  /  recorded local operations, not live Kubernetes events', '1;36')
+    feed=[]
+    # Source 1: existing command history, if present. Never display command args (may contain secrets).
+    try:
+        for item in HISTORY.read_text().splitlines()[-25:]:
+            match=re.match(r'([^|]+)\s*\|\s*exit=(\d+)',item)
+            if match:
+                feed.append((match.group(1).strip(), 'Ansible command completed' if match.group(2)=='0' else 'Command exited '+match.group(2)))
+    except OSError:pass
+    # Source 2: backup status (a successful attempt is not the same as a restore test).
+    if backup_time:feed.append((backup_time,'Backup status recorded: '+backup_state))
+    for when,event in feed[-3:][::-1]:line(f' {when[:22]:<22} {event}')
+    if not feed:line('No local activity records available.')
+    divider()
+    line('ansible-menu  full console  │  --alerts  detailed alerts  │  --details  hardware')
+    line('Use option 22 for live Kubernetes events; failover and restoration require separate tests.')
+    print('└'+'─'*interior+'┘')
+
+def target_prompt():
+    allowed=hosts()
+    print('Available:', ', '.join(allowed))
+    target=input('Exact inventory host: ').strip()
+    return target if target in allowed else None
+
+def adhoc(target, module, argument=None, become=False, ask_become=False):
+    args=['ansible',target,*BASE]
+    if become: args+=['-b']
+    if ask_become: args+=['-K']
+    args+=['-m',module]
+    if argument is not None:args+=['-a',argument]
+    return run(args)
+
+
+def acc_authorize_worker_target(target):
+    """Fail closed unless a configured inventory worker is selected."""
+    try:
+        config = load_config()
+        hosts = inventory_hosts()
+        authorize_worker(config, hosts, target)
+        return True
+    except (ACCConfigError, OSError, ValueError) as exc:
+        print(f"BLOCKED: Worker authorization failed: {exc}")
+        return False
+
+
+def reboot_one():
+    """Fail-closed reboot protection for Kubernetes nodes."""
+    try:
+        refresh_cluster_policy()
+    except Exception as exc:
+        print(f"BLOCKED: Cluster configuration invalid: {exc}")
+        return
+    target = target_prompt()
+    if not target:
+        print("Invalid host.")
+        return
+
+    ip = inventory_hosts().get(target, {}).get("ansible_host")
+
+    if ip in CONTROL_IPS:
+        print("BLOCKED: HA control-plane node.")
+        return
+
+    if not acc_authorize_worker_target(target):
+        print("BLOCKED: Unknown worker identity.")
+        return
+
+    print("WARNING: This operation does not drain Kubernetes workloads.")
+    print("Prefer option 20 for safe worker maintenance.")
+
+    confirmation = f"REBOOT {target} WITHOUT DRAIN"
+    if input(f"Type {confirmation}: ").strip() != confirmation:
+        print("Cancelled.")
+        return
+
+    adhoc(
+        target,
+        "ansible.builtin.reboot",
+        "reboot_timeout=600",
+        True,
+        True
+    )
+
+def kubectl_cmd(args):
+    if not shutil.which('kubectl'):
+        print('kubectl is not installed on Fedora. Kubernetes queries need a working kubeconfig.');return
+    run(['kubectl','--request-timeout=8s',*args])
+
+def kube_menu():
+    while True:
+        print('\nKUBERNETES (read-only; uses local kubectl context)')
+        print(' 1) Nodes / readiness  2) Pods across namespaces  3) Deployments  4) Services  0) Back')
+        c=input('Choose: ').strip()
+        if c=='1':kubectl_cmd(['get','nodes','-o','wide'])
+        elif c=='2':kubectl_cmd(['get','pods','-A','-o','wide'])
+        elif c=='3':kubectl_cmd(['get','deployments','-A'])
+        elif c=='4':kubectl_cmd(['get','services','-A'])
+        elif c=='0':return
+        else:print('Invalid choice.')
+
+def microk8s_audit():
+    # Resolve by inventory IP so the audit survives a safe alias rename.
+    try:
+        foundation = foundation_host()
+        config, inventory = refresh_cluster_policy()
+        foundation_ip = inventory[foundation]["ansible_host"]
+    except Exception as exc:
+        print(f"BLOCKED: Cannot resolve HA master: {exc}")
+        return
+
+    print(
+        f"\\nMicroK8s HA audit — read-only, "
+        f"queries {foundation} ({foundation_ip})."
+    )
+    print(
+        "Sudo password may be required. "
+        "Results include datastore quorum and pod health."
+    )
+    command=(
+        'echo "=== MICROK8S HIGH AVAILABILITY ==="; microk8s status; '
+        'echo "=== CLUSTER NODES ==="; microk8s kubectl get nodes -o wide; '
+        'echo "=== SYSTEM PODS ==="; microk8s kubectl get pods -A -o wide; '
+        'echo "=== VOLUMES ==="; microk8s kubectl get pv,pvc -A'
+    )
+    adhoc(foundation,'ansible.builtin.shell',command,True,True)
+
+def diagnostics():
+    target=target_prompt()
+    if not target:print('Invalid host.');return
+    print('\n1) Network routes/DNS  2) Disk usage  3) Recent system errors  4) Security services')
+    c=input('Choose: ').strip()
+    commands={
+       '1': 'ip -4 route; echo DNS; resolvectl status 2>/dev/null | head -45 || cat /etc/resolv.conf',
+       '2': 'df -hT; lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINTS',
+       '3': 'journalctl --no-pager -p err -n 35',
+       '4': 'systemctl is-active ssh; systemctl is-active apparmor; systemctl is-enabled apt-daily-upgrade.timer; (ufw status 2>/dev/null || true)',
+    }
+    if c not in commands: print('Invalid choice.');return
+    adhoc(target,'ansible.builtin.shell',commands[c])
+
+
+def add_inventory_host():
+    """Safely append a host to an existing INI inventory group."""
+    print('\nADD UBUNTU HOST — inventory registration')
+    print(f'Inventory: {INV}')
+    print('This updates only the Fedora inventory; it does not install Ubuntu or change the remote host.')
+    if not INV.exists():
+        print('Inventory file is missing.'); return
+    original=INV.read_text()
+    existing=inventory_hosts()
+    groups=[]
+    for line in original.splitlines():
+        m=re.match(r'^\s*\[([A-Za-z0-9_.-]+)\]\s*(?:[#;].*)?$',line)
+        if m and not m.group(1).endswith((':vars',':children')):
+            groups.append(m.group(1))
+    groups=list(dict.fromkeys(groups))
+    if not groups:
+        print('No regular [group] sections found. Create a group in hosts.ini first.');return
+    print('Available inventory groups: '+', '.join(groups))
+    default_group=next((g for g in groups if g in ('k3s_nodes','k3s','ubuntu','workers')),groups[0])
+    group=input(f'Group [{default_group}]: ').strip() or default_group
+    if group not in groups:
+        print('Cancelled: group must already exist in hosts.ini.');return
+    name=input('Inventory name (example node5): ').strip()
+    if not re.fullmatch(r'[A-Za-z][A-Za-z0-9_-]{0,62}',name):
+        print('Invalid hostname. Use letters, numbers, hyphens, underscores.');return
+    if name in existing or re.search(r'^\s*'+re.escape(name)+r'(?=\s|$)',original,re.M):
+        print('This inventory name already exists; no changes made.');return
+    ip=input('IPv4 address: ').strip()
+    try:
+        addr=ipaddress.ip_address(ip)
+        if addr.version != 4 or addr.is_multicast or addr.is_unspecified:
+            raise ValueError('Must be a usable IPv4 host address')
+    except ValueError as e:
+        print('Invalid IP:',e);return
+    for oldname,params in existing.items():
+        if str(params.get('ansible_host',oldname))==ip:
+            print(f'IP address already used by {oldname}. No changes made.');return
+    user=input('SSH username [supergimp]: ').strip() or 'supergimp'
+    if not re.fullmatch(r'[a-z_][a-z0-9_-]*',user):
+        print('Invalid SSH username.');return
+    print('Sudo executable: 1) Standard sudo  2) /usr/bin/sudo.ws (Ubuntu sudo-rs workaround)')
+    sudo_choice=input('Choose [1]: ').strip() or '1'
+    if sudo_choice not in ('1','2'):
+        print('Invalid choice.');return
+    extras=f' ansible_become_exe=/usr/bin/sudo.ws' if sudo_choice=='2' else ''
+    entry=f'{name} ansible_host={ip} ansible_user={user}{extras}'
+    print('\nProposed entry in ['+group+']:\n  '+entry)
+    if input('Type ADD to save: ').strip() != 'ADD':
+        print('Cancelled.');return
+    # Insert immediately before the next inventory section to avoid writing into :vars.
+    lines=original.splitlines(keepends=True)
+    start=None
+    for i,line in enumerate(lines):
+        if re.match(r'^\s*\['+re.escape(group)+r'\]\s*(?:[#;].*)?$',line.rstrip('\r\n')):
+            start=i;break
+    if start is None:
+        print('Target group disappeared; no changes made.');return
+    end=next((i for i in range(start+1,len(lines)) if re.match(r'^\s*\[',lines[i])),len(lines))
+    if end>0 and lines[end-1] and not lines[end-1].endswith('\n'):
+        lines[end-1]+='\n'
+    lines.insert(end,entry+'\n')
+    stamp=datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
+    backup=INV.with_name(INV.name+'.bak-'+stamp)
+    try:
+        shutil.copy2(INV,backup)
+        tmp=INV.with_name(INV.name+'.new')
+        tmp.write_text(''.join(lines))
+        tmp.chmod(INV.stat().st_mode & 0o777)
+        test=subprocess.run(['ansible-inventory','-i',str(tmp),'--list'],capture_output=True,text=True)
+        valid=False
+        if test.returncode==0:
+            try:
+                hostvars=json.loads(test.stdout).get('_meta',{}).get('hostvars',{})
+                valid=name in hostvars and hostvars[name].get('ansible_host')==ip
+            except (ValueError,KeyError):pass
+        if not valid:
+            tmp.unlink(missing_ok=True)
+            print('Inventory validation failed; original inventory is unchanged.')
+            print((test.stderr or test.stdout)[-800:]);return
+        os.replace(tmp,INV)
+    except (OSError,ValueError) as e:
+        print('Unable to update inventory:',e);return
+    print(f'Added {name} to [{group}]. Backup: {backup}')
+    if input('Install the existing Ansible public key on this host now? [y/N]: ').strip().lower()=='y':
+        pub=Path(str(KEY)+'.pub')
+        if not pub.exists():
+            print(f'Public key not found: {pub}')
+        else:
+            print('You may be prompted for the remote Ubuntu account password.')
+            run(['ssh-copy-id','-i',str(pub),'-o','IdentitiesOnly=yes','-o','IdentityAgent=none',
+                 '-o','IdentityFile='+str(KEY),f'{user}@{ip}'])
+    print(f'\nTest: ansible {name} -i {INV} --private-key {KEY} -m ping')
+    if input('Run the Ansible ping test now? [Y/n]: ').strip().lower()!='n':
+        adhoc(name,'ping')
+    print('If SSH login is not ready, the host will appear unavailable until access is configured.')
+    print('Run the k3s prerequisites playbook for the new node only after validating SSH and sudo.')
+
+def fix_node1_alias():
+    """Disabled: legacy deployment-specific migration."""
+    print("DISABLED: Legacy node migration is not available in the public release.")
+    return
+
+def show_history():
+    if not HISTORY.exists():print('No command history yet.');return
+    for line in HISTORY.read_text().splitlines()[-30:]:print(line)
+
+def show_help():
+    print('\nStatus and details are read-only. Dashboard update counts use cached apt lists.')
+    print('Upgrade commands require confirmation and may disrupt cluster workloads.')
+    print('Before MicroK8s maintenance: verify backups, node roles, and dqlite quorum; drain workloads as appropriate.')
+    print('kubectl uses your local Fedora kubeconfig; no credentials are copied to nodes.')
+    print(f'Command history: {HISTORY}')
+    print('Python interpreter warnings are informational; configure per-node if desired.')
+    print('MicroK8s audits resolve the bootstrap host by its verified inventory IP, not a fixed alias.')
+
+
+# v5 operations helpers: cluster mutations are explicitly confirmed and fail closed.
+STATE_DIR = HOME / '.local/state/ansible-control-center'
+BACKUP_DIR = Path(expand_path(load_config()['backups']['directory']))
+CONTROL_IPS = set()
+
+def refresh_cluster_policy():
+    global CONTROL_IPS
+    from acc_config import load_config
+    from acc_cluster_policy import cluster_master_addresses
+
+    config = load_config()
+    inventory = inventory_hosts()
+    CONTROL_IPS = cluster_master_addresses(config, inventory)
+    return config, inventory
+
+
+def foundation_host():
+    from acc_cluster_policy import foundation_master
+
+    config, inventory = refresh_cluster_policy()
+    return foundation_master(config, inventory)
+
+def micro_query(command, *, ask_password=True):
+    try: host=foundation_host()
+    except RuntimeError as e: print('BLOCKED:',e); return 1
+    args=['ansible',host,*BASE,'-b']
+    if ask_password: args+=['-K']
+    args+=['-m','ansible.builtin.command','-a',command]
+    return run(args)
+
+def read_cluster_json(command):
+    # Read-only MicroK8s API probe over existing SSH identity; no Fedora kubeconfig needed.
+    try: host=foundation_host()
+    except RuntimeError as e: return None,str(e)
+    args=['ansible',host,*BASE,'-m','ansible.builtin.shell',
+          '-a', 'microk8s kubectl '+shlex.join(command)+' 2>/dev/null']
+    p=subprocess.run(args,capture_output=True,text=True,timeout=45)
+    if p.returncode: return None,(p.stderr or p.stdout)[-350:]
+    # Default Ansible oneline output includes host header followed by JSON.
+    raw=p.stdout
+    for marker in ('>>\n','>>\r\n'):
+        if marker in raw:
+            raw=raw.split(marker,1)[1]; break
+    try: return json.loads(raw),None
+    except ValueError: return None,'Kubernetes JSON parse unavailable (permissions or callback format). Use option 16.'
+
+
+def restart_event_history(limit=10):
+    """Read Kubernetes restart events without changing the journal."""
+    path = STATE_DIR / 'pod-restarts' / 'events.json'
+
+    if not path.exists():
+        return []
+
+    try:
+        events = json.loads(path.read_text(encoding='utf-8'))
+        if not isinstance(events, list):
+            raise ValueError("Invalid event journal")
+        if any(not isinstance(event, dict) for event in events):
+            raise ValueError("Malformed event record")
+        return events[-limit:]
+    except (OSError, ValueError, TypeError) as exc:
+        print("WARNING: Restart history unavailable:", exc)
+        return None
+
+
+def display_restart_events(limit=10):
+    """Display historical Kubernetes restart events."""
+    events = restart_event_history(limit)
+
+    print("\nKUBERNETES RESTART EVENT HISTORY")
+
+    if events is None:
+        print("Restart event history could not be read.")
+    elif not events:
+        print("No recorded restart events.")
+    else:
+        for event in events:
+            print(
+                f"[{event.get('severity', 'WARN')}] "
+                f"{event.get('timestamp', '?')} "
+                f"{event.get('namespace', '?')}/{event.get('pod', '?')} "
+                f"node={event.get('node', '?')} "
+                f"container={event.get('container', '?')} "
+                f"type={event.get('container_type', '?')} "
+                f"new={event.get('new_restarts', '?')}"
+            )
+
+def alerts_and_snapshot(save=False):
+    known,results=collect()
+    if not known:
+        print("WARNING: Infrastructure collection unavailable.")
+        display_restart_events(limit=10)
+        return
+    alerts=[]
+    summary={'checked_at':datetime.datetime.now(datetime.timezone.utc).isoformat(), 'hosts':{}}
+    for host in known:
+        d=results.get(host,{})
+        if 'error' in d:
+            alerts.append(('CRITICAL',f'{host}: SSH/status collection failed')); continue
+        summary['hosts'][host]={'ip':d.get('ip'), 'cpu':d.get('cpu'), 'ram':d.get('ram'),
+                                'disk':d.get('disk'),'temp':d.get('temp'),'updates':d.get('updates')}
+        if d.get('disk') is not None and d['disk']>=90: alerts.append(('CRITICAL',f'{host}: disk {d["disk"]}%'))
+        elif d.get('disk') is not None and d['disk']>=80: alerts.append(('WARN',f'{host}: disk {d["disk"]}%'))
+        if d.get('temp') is not None and d['temp']>=85: alerts.append(('CRITICAL',f'{host}: temperature {d["temp"]}C'))
+        elif d.get('temp') is not None and d['temp']>=75: alerts.append(('WARN',f'{host}: temperature {d["temp"]}C'))
+        if d.get('ram') is not None and d['ram']>=90: alerts.append(('WARN',f'{host}: RAM {d["ram"]}%'))
+        if d.get('reboot'): alerts.append(('WARN',f'{host}: reboot required'))
+        if d.get('hostname')!=host: alerts.append(('WARN',f'{host}: hostname {d.get("hostname")} mismatch'))
+    kubes=[(h,(results.get(h,{}) or {}).get('microk8s') or {}) for h in known]
+    valid=[(h,k) for h,k in kubes if k.get('api')=='ok' and k.get('cluster_nodes') is not None]
+    if not valid: alerts.append(('UNKNOWN','Kubernetes API monitoring unavailable'))
+    else:
+        h,k=max(valid,key=lambda item:item[1].get('cluster_nodes') or 0)
+        summary['kubernetes']={'source':h,'ready':k.get('cluster_ready'),'total':k.get('cluster_nodes'),
+                               'pods_healthy':k.get('pods_healthy'),'pods_total':k.get('pods_total'),
+                               'ha':k.get('ha'),'masters':k.get('masters',[])}
+        if k.get('cluster_ready') != k.get('cluster_nodes'):alerts.append(('CRITICAL','Kubernetes node NotReady'))
+        if k.get('pods_healthy') != k.get('pods_total'):alerts.append(('WARN','Kubernetes pods not healthy'))
+        if k.get('ha')!='yes' or len(k.get('masters') or [])<3: alerts.append(('CRITICAL','MicroK8s HA not verified'))
+    status=BACKUP_DIR/'backup-status.json'
+    if not status.exists(): alerts.append(('WARN','No backup-status.json found'))
+    else:
+        try:
+            b=json.loads(status.read_text())
+            age=(datetime.datetime.now(datetime.timezone.utc)-datetime.datetime.fromisoformat(b['checked_at'])).total_seconds()/3600
+            if b.get('status')!='OK':alerts.append(('CRITICAL','Last backup not successful'))
+            if age>36: alerts.append(('WARN',f'Last backup attempt {age:.1f}h old'))
+            summary['backup_status']=b.get('status');summary['backup_age_hours']=round(age,2)
+        except (ValueError,KeyError,OSError,TypeError):alerts.append(('WARN','Backup status unreadable'))
+    summary['alerts']=[{'severity':sev,'message':msg} for sev,msg in alerts]
+    print('\nACTIVE INFRASTRUCTURE ALERTS')
+    if not alerts:print(color(' No threshold violations in current snapshot','32'))
+    for sev,msg in alerts:print(color(f' [{sev}] {msg}','31' if sev=='CRITICAL' else '33'))
+    if save:
+        dest=STATE_DIR/'snapshots';dest.mkdir(parents=True,exist_ok=True,mode=0o700)
+        fn=dest/(datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%SZ')+'.json')
+        fd=os.open(str(fn),os.O_CREAT|os.O_EXCL|os.O_WRONLY,0o600)
+        with os.fdopen(fd,'w') as f:json.dump(summary,f,indent=2)
+        print('Saved private snapshot:',fn)
+
+    display_restart_events(limit=10)
+
+def backup_operations():
+    while True:
+        print('\nBACKUP OPERATIONS | 1 Status  2 Recent logs  3 Verify checksums  4 Backup now  0 Back')
+        c=input('Choose: ').strip()
+        if c=='0':return
+        if c=='1':
+            backup_health();run(['systemctl','list-timers','--all','microk8s-backup.timer'])
+        elif c=='2':run(['journalctl','-u','microk8s-backup.service','-n','50','--no-pager'])
+        elif c=='3':
+            backup_dir=BACKUP_DIR/'dqlite'
+            sums=sorted(backup_dir.glob('*.sha256'))
+            if not sums:print('No SHA256 files to verify.');continue
+            print(f'Checking {len(sums)} checksum files locally')
+            for fn in sums:
+                p=subprocess.run(['sha256sum','-c',fn.name],cwd=backup_dir)
+                if p.returncode:print('FAILED:',fn)
+        elif c=='4':
+            if input('Type BACKUP NOW to trigger the configured Fedora service: ').strip()!='BACKUP NOW':continue
+            # Authentication via polkit/sudo as required by local systemd.
+            run(['sudo','systemctl','start','microk8s-backup.service'])
+            run(['systemctl','status','microk8s-backup.service','--no-pager'])
+
+def security_audit():
+    target=target_prompt()
+    if not target:return
+    command=('echo SSHD; systemctl is-active ssh 2>/dev/null || systemctl is-active sshd 2>/dev/null || true; '
+             'echo FIREWALL; systemctl is-active ufw 2>/dev/null || true; '
+             'echo AUTOUPDATES; systemctl is-enabled unattended-upgrades 2>/dev/null || true; '
+             'echo FAILED_SERVICES; systemctl --failed --no-legend --no-pager | head -15; '
+             'echo REBOOT_REQUIRED; test -e /var/run/reboot-required && echo yes || echo no')
+    adhoc(target,'ansible.builtin.shell',command)
+
+def history_snapshots():
+    d=STATE_DIR/'snapshots'
+    items=sorted(d.glob('*.json'))[-15:] if d.exists() else []
+    if not items:
+        print('No infrastructure snapshots saved.')
+        display_restart_events(limit=25)
+        return
+    for f in items:
+        try:
+            dct=json.loads(f.read_text())
+            print(f.name,'nodes',len(dct.get('hosts',{})),'alerts',len(dct.get('alerts',[])))
+        except (OSError,ValueError):print(f.name,'unreadable')
+
+    display_restart_events(limit=25)
+
+def worker_maintenance():
+    try:
+        refresh_cluster_policy()
+    except Exception as exc:
+        print(f"BLOCKED: Cluster configuration invalid: {exc}")
+        return
+    print('\nSAFE WORKER MAINTENANCE (control planes deliberately blocked)')
+    target=target_prompt()
+    if not target:return
+    props=inventory_hosts().get(target,{})
+    ip=props.get('ansible_host')
+    if ip in CONTROL_IPS:
+        print('BLOCKED: control-plane maintenance requires a separate quorum-aware procedure.');return
+    if not acc_authorize_worker_target(target):
+        print('BLOCKED: unknown worker identity; review inventory first.');return
+    bfile=BACKUP_DIR/'backup-status.json'
+    try:
+        b=json.loads(bfile.read_text());date=datetime.datetime.fromisoformat(b['checked_at'])
+        age=(datetime.datetime.now(datetime.timezone.utc)-date).total_seconds()/3600
+        if b.get('status')!='OK' or age>36: raise ValueError('No fresh successful backup')
+    except (OSError,KeyError,ValueError,TypeError) as e:
+        print('BLOCKED: backup status check failed:',e);return
+    # The API must confirm full health before any workload movement.
+    nodes,error=read_cluster_json(['get','nodes','-o','json'])
+    if error:print('BLOCKED:',error);return
+    items=nodes.get('items',[])
+    if len(items)!=5 or any(not any(x.get('type')=='Ready' and x.get('status')=='True' for x in n.get('status',{}).get('conditions',[])) for n in items):
+        print('BLOCKED: Kubernetes does not report five Ready nodes.');return
+    print('Preflight: backup fresh; all five Kubernetes nodes Ready.')
+    print('NOTE: drain can be blocked by pod disruption budgets or unmanaged pods.')
+    print('This workflow updates/reboots one worker; the cluster API is accessed through node1.')
+    if input(f'Type MAINTAIN {target} to proceed: ').strip()!=f'MAINTAIN {target}':return
+    # Each step checked; if update or reboot fails, leave cordoned for investigation.
+    try:foundation=foundation_host()
+    except RuntimeError as e:print('BLOCKED:',e);return
+    def api(args):
+        return run(['ansible',foundation,*BASE,'-b','-K','-m','ansible.builtin.command',
+                    '-a','microk8s kubectl '+shlex.join(args)])
+    if api(['cordon',target]):print('Failed cordon; stopping.');return
+    if api(['drain',target,'--ignore-daemonsets','--delete-emptydir-data','--timeout=180s']):
+        print('Drain incomplete; node remains cordoned. Investigate before uncordoning.');return
+    print('Drain succeeded. Running package upgrade on',target)
+    if adhoc(target,'ansible.builtin.apt','update_cache=yes upgrade=dist',True,True):
+        print('Update failure. Node stays cordoned; investigate.');return
+    if input(f'Type REBOOT {target} to reboot, otherwise leave cordoned: ').strip()!=f'REBOOT {target}':return
+    if adhoc(target,'ansible.builtin.reboot','reboot_timeout=900',True,True):
+        print('Reboot failure. Node stays cordoned.');return
+    # Kubernetes readiness check before uncordon.
+    n,err=read_cluster_json(['get','node',target,'-o','json'])
+    if err or not any(c.get('type')=='Ready' and c.get('status')=='True' for c in (n or {}).get('status',{}).get('conditions',[])):
+        print('Node readiness not confirmed; node stays cordoned.',err or 'NotReady');return
+    if input(f'Node Ready. Type UNCORDON {target} to resume scheduling: ').strip()==f'UNCORDON {target}':
+        api(['uncordon',target])
+    else:print('Node remains cordoned by choice.')
+
+def workload_views():
+    print('\nKUBERNETES READ-ONLY AUDIT (via node1)')
+    print('1 Nodes  2 Pods  3 Deployments  4 Services  5 PVCs  6 Recent events  0 Back')
+    c=input('Choose: ').strip()
+    args={'1':'get nodes -o wide','2':'get pods -A -o wide','3':'get deployments -A',
+          '4':'get services -A','5':'get pvc -A','6':'get events -A --sort-by=.lastTimestamp'}
+    if c in args:micro_query('kubectl '+args[c])
+
+def preflight_report():
+    print('\nPREFLIGHT: run cluster audit, backup status, timer and Ansible ping before maintenance')
+    backup_health()
+    run(['systemctl','is-enabled','microk8s-backup.timer'])
+    run(['ansible','all',*BASE,'-m','ping'])
+    print('For authoritative quorum/dqlite membership use menu option 16.')
+
+# --- ACC v6.1 supplementary read-only functions ---
+ACC_VERSION = '6.2.0-rc2'
+ACC_CA = HOME / '.config/ansible-control-center/certs/kubernetes-ca.crt'
+
+def safe_capture(argv, timeout=16):
+    try:
+        p=subprocess.run(argv, capture_output=True, text=True, timeout=timeout, check=False)
+        return p.returncode, p.stdout.strip(), p.stderr.strip()[:240]
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return 127, '', str(exc)[:240]
+
+def kube_json(args):
+    code, output, error=safe_capture(['kubectl','--request-timeout=8s',*args,'-o','json'],25)
+    if code:
+        print('Kubernetes query unavailable:',error or 'exit '+str(code))
+        return None
+    try:return json.loads(output)
+    except ValueError:
+        print('Kubernetes response is not JSON');return None
+
+def kubernetes_access():
+    print('\nKUBERNETES ACCESS (read-only)')
+    for args in (['config','current-context'], ['auth','can-i','list','nodes'],
+                 ['auth','can-i','delete','pods','--all-namespaces'],
+                 ['auth','can-i','get','secrets','--all-namespaces']):
+        code, output, err=safe_capture(['kubectl',*args],25)
+        print(' '.join(args)+':',output or err or 'no response', '(exit '+str(code)+')')
+    code,_,err=safe_capture(['kubectl','--request-timeout=8s','get','--raw=/readyz'],20)
+    print('API readyz:', 'reachable' if code==0 else 'unavailable ('+err+')')
+    print('Note: checks validate current credentials; token issuer/API failover needs separate testing.')
+
+def cluster_health_v61():
+    print('\nCLUSTER HEALTH — live Kubernetes view; no mutation')
+    data=kube_json(['get','nodes'])
+    if not data:return
+    nodes=data.get('items',[])
+    ready=[n for n in nodes if any(x.get('type')=='Ready' and x.get('status')=='True'
+            for x in n.get('status',{}).get('conditions',[]))]
+    print('Ready nodes:',len(ready),'/',len(nodes))
+    for n in nodes:
+        if n not in ready:print('ALERT NotReady:',n.get('metadata',{}).get('name'))
+    pods=kube_json(['get','pods','-A'])
+    if pods is not None:
+        items=pods.get('items',[])
+        troubled=[p for p in items if p.get('status',{}).get('phase') not in ('Running','Succeeded') or
+                 any(not c.get('ready',False) for c in p.get('status',{}).get('containerStatuses',[]) if p.get('status',{}).get('phase')=='Running')]
+        print('Pods:',len(items),'potentially unhealthy:',len(troubled))
+        for p in troubled[:15]: print('  ',p.get('metadata',{}).get('namespace'),p.get('metadata',{}).get('name'),p.get('status',{}).get('phase'))
+    print('HA datastore quorum: NOT VERIFIED by Kubernetes readiness. Use option 16.')
+    print('Backups:')
+    backup_health()
+
+def pod_analysis():
+    """Run restart analysis with exclusive single-writer protection."""
+    import fcntl
+
+    lock_dir = STATE_DIR / 'pod-restarts'
+    lock_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    lock_dir.chmod(0o700)
+
+    lock_path = lock_dir / '.analysis.lock'
+
+    with open(lock_path, 'a+', encoding='utf-8') as lock:
+        os.chmod(lock_path, 0o600)
+        try:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print("Restart analysis already running; no changes made.")
+            return
+
+        return _pod_analysis_locked()
+
+def _pod_analysis_locked():
+    """Read-only Kubernetes restart analysis with local snapshot history."""
+    import tempfile
+
+    print("\nKUBERNETES POD RESTART ANALYSIS — v6.2")
+    data = kube_json(['get', 'pods', '-A'])
+    if data is None:
+        print("No snapshot saved: Kubernetes API unavailable.")
+        return
+
+    # Reject invalid or incomplete Kubernetes list responses.
+    if not isinstance(data, dict) or not isinstance(data.get('items'), list):
+        print("BLOCKED: Invalid Kubernetes pod list; baseline preserved.")
+        return
+
+    if not data['items']:
+        print("BLOCKED: Empty Kubernetes pod list; baseline preserved.")
+        return
+
+    if (data.get('metadata') or {}).get('continue'):
+        print("BLOCKED: Paginated result; baseline preserved.")
+        return
+
+    folder = STATE_DIR / 'pod-restarts'
+    snapshot = folder / 'latest.json'
+
+    previous = None
+    if snapshot.exists():
+        try:
+            previous = json.loads(snapshot.read_text(encoding='utf-8'))
+            if not isinstance(previous.get('containers'), dict):
+                raise ValueError("Invalid snapshot structure")
+        except (OSError, ValueError, TypeError) as exc:
+            print("Snapshot invalid; refusing to overwrite:", exc)
+            return
+
+    old = previous['containers'] if previous else {}
+    current = {}
+    rows = []
+    total_main = 0
+    total_init = 0
+    total_new_main = 0
+    total_new_init = 0
+    restart_alerts = []
+    restart_transitions = []
+
+    for pod in data.get('items', []):
+        meta = pod.get('metadata') or {}
+        status = pod.get('status') or {}
+
+        ns = meta.get('namespace', '?')
+        name = meta.get('name', '?')
+        uid = meta.get('uid')
+        node_name = (pod.get('spec') or {}).get('nodeName', '?')
+        phase = status.get('phase', 'Unknown')
+
+        if not uid:
+            print("Missing pod UID; snapshot not saved:", ns, name)
+            return
+
+        counts = {'main': 0, 'init': 0}
+        deltas = {'main': 0, 'init': 0}
+        problems = []
+
+        for kind, field in (
+            ('main', 'containerStatuses'),
+            ('init', 'initContainerStatuses')
+        ):
+            for container in status.get(field) or []:
+                cname = container.get('name', '?')
+                count = int(container.get('restartCount') or 0)
+                key = json.dumps([uid, kind, cname])
+
+                current[key] = count
+                counts[kind] += count
+
+                # A new UID/container starts a new measurement baseline.
+                if key in old:
+                    delta = count - int(old[key])
+                    if delta > 0:
+                        deltas[kind] += delta
+                        restart_transitions.append({
+                            'uid': uid,
+                            'namespace': ns,
+                            'pod': name,
+                            'node': node_name,
+                            'container_type': kind,
+                            'container': cname,
+                            'previous_count': int(old[key]),
+                            'current_count': count,
+                            'new_restarts': delta
+                        })
+
+                waiting = (container.get('state') or {}).get('waiting')
+                if waiting:
+                    reason = waiting.get('reason', 'Unknown')
+                    problems.append(f"{kind}:{cname}:{reason}")
+                elif (
+                    kind == 'main'
+                    and phase == 'Running'
+                    and not container.get('ready', False)
+                ):
+                    problems.append(f"main:{cname}:NotReady")
+
+        if previous is not None:
+            for kind in ('main', 'init'):
+                if deltas[kind] > 0:
+                    restart_alerts.append({
+                        'severity': 'WARN',
+                        'node': node_name,
+                        'pod': f"{ns}/{name}",
+                        'container_type': kind,
+                        'new_restarts': deltas[kind],
+                        'message': (
+                            f"{ns}/{name} on {node_name}: "
+                            f"{deltas[kind]} new {kind} container restart(s)"
+                        )
+                    })
+
+        total_main += counts['main']
+        total_init += counts['init']
+        total_new_main += deltas['main']
+        total_new_init += deltas['init']
+
+        if phase not in ('Running', 'Succeeded'):
+            problems.append(f"Pod:{phase}")
+
+        rows.append({
+            'name': f"{ns}/{name}",
+            'node': node_name,
+            'phase': phase,
+            'main': counts['main'],
+            'init': counts['init'],
+            'new_main': deltas['main'],
+            'new_init': deltas['init'],
+            'problems': problems
+        })
+
+    print("Pods analyzed:", len(rows))
+    print("Main-container restart total:", total_main)
+    print("Init-container restart total:", total_init)
+
+    if previous is None:
+        print("Historical comparison: INITIAL BASELINE")
+    else:
+        print("Previous snapshot:", previous.get('captured_at', '?'))
+        print("New main-container restarts:", total_new_main)
+        print("New init-container restarts:", total_new_init)
+
+    print("\nPOD DETAILS")
+    print("-" * 100)
+
+    rows.sort(
+        key=lambda r: (
+            r['new_main'] + r['new_init'],
+            len(r['problems']),
+            r['main'] + r['init']
+        ),
+        reverse=True
+    )
+
+    for row in rows:
+        print(f"{row['name']} | node={row['node']}")
+        print(
+            f"  phase={row['phase']} "
+            f"main={row['main']} init={row['init']} "
+            f"new_main={row['new_main']} new_init={row['new_init']}"
+        )
+        for problem in row['problems']:
+            print("  ALERT:", problem)
+
+    print("\nNEW RESTART ALERTS")
+    if restart_alerts:
+        for alert in restart_alerts:
+            print(f"  [{alert['severity']}] {alert['message']}")
+    else:
+        print("  No new restart increases detected.")
+
+    # Durable event history. Event IDs prevent duplicate records
+    # after retries or interrupted baseline updates.
+    import hashlib
+
+    journal = folder / 'events.json'
+
+    try:
+        if journal.exists():
+            events = json.loads(journal.read_text(encoding='utf-8'))
+            if not isinstance(events, list):
+                raise ValueError("Invalid event journal")
+        else:
+            events = []
+    except (OSError, ValueError, TypeError) as exc:
+        print("BLOCKED: Restart event journal unavailable:", exc)
+        return
+
+    existing_ids = {
+        event.get('id')
+        for event in events
+        if isinstance(event, dict)
+    }
+
+    timestamp = datetime.datetime.now(
+        datetime.timezone.utc
+    ).isoformat()
+
+    new_events = []
+
+    for transition in restart_transitions:
+        identity = json.dumps(
+            [
+                transition['uid'],
+                transition['container_type'],
+                transition['container'],
+                transition['previous_count'],
+                transition['current_count']
+            ],
+            separators=(',', ':')
+        )
+
+        event_id = hashlib.sha256(identity.encode()).hexdigest()
+
+        if event_id not in existing_ids:
+            new_events.append({
+                'id': event_id,
+                'timestamp': timestamp,
+                'severity': 'WARN',
+                **transition
+            })
+            existing_ids.add(event_id)
+
+    if new_events:
+        journal_record = events + new_events
+        folder.mkdir(parents=True, exist_ok=True, mode=0o700)
+
+        import tempfile
+        fd, temporary = tempfile.mkstemp(
+            prefix='.events-',
+            suffix='.tmp',
+            dir=folder
+        )
+
+        try:
+            with os.fdopen(fd, 'w', encoding='utf-8') as stream:
+                json.dump(journal_record, stream, indent=2)
+                stream.flush()
+                os.fsync(stream.fileno())
+
+            os.chmod(temporary, 0o600)
+            os.replace(temporary, journal)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+
+        print("Restart events recorded:", len(new_events))
+
+    record = {
+        'schema': 1,
+        'captured_at': datetime.datetime.now(
+            datetime.timezone.utc
+        ).isoformat(),
+        'containers': current,
+        'alerts': restart_alerts
+    }
+
+    try:
+        folder.mkdir(parents=True, exist_ok=True, mode=0o700)
+        folder.chmod(0o700)
+
+        fd, temporary = tempfile.mkstemp(
+            prefix='.pod-restarts-',
+            suffix='.tmp',
+            dir=folder
+        )
+        try:
+            with os.fdopen(fd, 'w', encoding='utf-8') as stream:
+                json.dump(record, stream, indent=2)
+                stream.flush()
+                os.fsync(stream.fileno())
+
+            os.chmod(temporary, 0o600)
+            os.replace(temporary, snapshot)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+
+        print("\nSnapshot saved:", snapshot)
+    except OSError as exc:
+        print("WARNING: Could not save restart snapshot:", exc)
+
+    print(
+        "Note: new counts represent changes since the last "
+        "successful snapshot, not necessarily new incidents."
+    )
+
+def certificate_status():
+    print('\nCERTIFICATE STATUS (read-only; no key material shown)')
+    paths=[ACC_CA, HOME/'.config/ansible-control-center/token-issuer/issuer.crt']
+    for path in paths:
+        if not path.is_file():print('NOT FOUND:',path);continue
+        code,out,err=safe_capture(['openssl','x509','-in',str(path),'-noout','-enddate','-subject'],10)
+        print(path,':',out if code==0 else err)
+        c,_,_=safe_capture(['openssl','x509','-in',str(path),'-noout','-checkend','2592000'],10)
+        print('  Expires within 30 days:', 'YES' if c!=0 else 'no')
+    print('CA/issuer dates do not represent the API serving certificate expiration.')
+
+def monitoring_status():
+    print('\nMONITORING SERVICE AND DATA')
+    for unit in ['acc-monitor.timer','acc-monitor.service']:
+        for prop in ['ActiveState','Result','ExecMainStatus','LastTriggerUSec'] if unit.endswith('timer') else ['ActiveState','Result','ExecMainStatus','ExecMainExitTimestamp']:
+            code,out,err=safe_capture(['systemctl','--user','show',unit,'-p',prop],7)
+            print(unit, out if code==0 else err)
+    code,out,err=safe_capture(['systemctl','--user','list-timers','--all','--no-pager','acc-monitor.timer'],7)
+    print(out if code==0 else err)
+    state=HOME/'.local/state/ansible-control-center'
+    for p in sorted(state.glob('*.db'))+sorted(state.glob('*.sqlite*')):
+        print('Telemetry database exists:',p.name,'size:',p.stat().st_size,'bytes (not opened)')
+    print('Monitoring application logs: journalctl --user -u acc-monitor.service --no-pager')
+
+def disk_audit():
+    print('\nREAD-ONLY DISK INVENTORY / SMART AVAILABILITY')
+    hosts_available=hosts()
+    if not hosts_available:return
+    for host in hosts_available:
+        print('---',host)
+        script='command -v smartctl || true; command -v nvme || true; lsblk -dn -o NAME,SIZE,MODEL,TRAN'
+        code,out,err=safe_capture(['ansible',host,*BASE,'-m','shell','-a',script],35)
+        print((out or err or 'No output')[-1600:])
+    print('SMART health requires separate privileged read-only collection; not interpreted here.')
+
+def storage_health():
+    for args in [['get','pv'],['get','pvc','-A'],['get','storageclasses']]:
+        print('\n',' '.join(args))
+        kubectl_cmd(args)
+    print('Capacity and attachment status require storage backend inspection.')
+
+def failed_services():
+    print('\nFAILED SYSTEMD UNITS — all inventory nodes')
+    script='systemctl --failed --no-pager --no-legend --plain | head -30; true'
+    code,out,err=safe_capture(['ansible','all',*BASE,'-m','shell','-a',script],70)
+    print(out if code==0 else 'Check failed: '+(err or out)[-1500:])
+
+def kube_events():
+    data=kube_json(['get','events','-A'])
+    if data is None:return
+    events=data.get('items',[])
+    warnings=[e for e in events if e.get('type')=='Warning']
+    print('Current API events:',len(events),'warnings:',len(warnings))
+    for event in warnings[-25:]:
+        obj=event.get('involvedObject',{})
+        print(event.get('metadata',{}).get('namespace'),obj.get('name'),event.get('reason'),
+              str(event.get('message','')).replace('\n',' ')[:140])
+    print('Kubernetes Events are transient; absence of warnings is not historical proof.')
+
+def export_report():
+    print('\nEXPORT LOCAL JSON REPORT (without Kubernetes Secrets or tokens)')
+    node_data=kube_json(['get','nodes'])
+    pod_data=kube_json(['get','pods','-A'])
+    if node_data is None or pod_data is None:
+        print('No partial report saved.');return
+    report={'version':ACC_VERSION,'captured_at':datetime.datetime.now(datetime.timezone.utc).isoformat(),
+       'nodes':[{'name':n.get('metadata',{}).get('name'), 'ready':any(c.get('type')=='Ready' and c.get('status')=='True'
+                 for c in n.get('status',{}).get('conditions',[]))} for n in node_data.get('items',[])],
+       'pods':[{'namespace':p.get('metadata',{}).get('namespace'), 'name':p.get('metadata',{}).get('name'),
+                'phase':p.get('status',{}).get('phase'), 'restarts':sum(int(x.get('restartCount') or 0)
+                for x in p.get('status',{}).get('containerStatuses',[]))} for p in pod_data.get('items',[])]}
+    folder=STATE_DIR/'reports';folder.mkdir(parents=True,exist_ok=True,mode=0o700)
+    path=folder/(datetime.datetime.now(datetime.timezone.utc).strftime('acc-%Y%m%dT%H%M%SZ')+'.json')
+    try:
+        fd=os.open(str(path),os.O_CREAT|os.O_EXCL|os.O_WRONLY,0o600)
+        with os.fdopen(fd,'w') as file:json.dump(report,file,indent=2)
+        print('Saved private report:',path)
+    except OSError as exc:print('Export unsuccessful:',exc)
+
+def ha_membership_check_v62():
+    """Run the standalone read-only MicroK8s membership checker."""
+    program = Path(__file__).resolve()
+    if program == Path('/usr/local/bin/ansible-menu'):
+        checker = Path(
+            '/usr/local/libexec/ansible-control-center/'
+            'ha-membership-check.py'
+        )
+    else:
+        checker = program.with_name('ha-membership-check.py')
+
+    print('\nMICROK8S HA MEMBERSHIP VERIFICATION — v6.2')
+    print('Read-only check of node1, node2 and node6.')
+    print('This does not independently establish live dqlite consensus.')
+
+    if not checker.is_file():
+        print('UNAVAILABLE: HA checker script missing:', checker)
+        return
+
+    code = run([sys.executable, str(checker)])
+
+    print('\nHA checker exit code:', code)
+    if code != 0:
+        print('WARNING: HA membership was not fully verified.')
+        print('No cluster maintenance action was performed.')
+
+EXTENDED_MENU={'26':kubernetes_access, '27':cluster_health_v61, '28':pod_analysis,
+ '29':certificate_status, '30':monitoring_status, '31':disk_audit,
+ '32':storage_health, '33':failed_services, '34':kube_events, '35':export_report, '36':ha_membership_check_v62}
+
+
+
+# --- End ACC v6.1 extension ---
+
+def menu():
+    try:
+        refresh_cluster_policy()
+    except Exception as exc:
+        print(f"BLOCKED: Cluster configuration invalid: {exc}")
+        return
+    while True:
+        print('\n'+'='*60)
+        print(' ANSIBLE CONTROL CENTER v6.2 — fedora-server1')
+        print('='*60)
+        print(' DASHBOARD')
+        print('  1) Live cluster dashboard')
+        print('  2) Auto-refresh dashboard (60 seconds)')
+        print('  3) Detailed hardware / reboot / Kubernetes status')
+        print(' MAINTENANCE')
+        print('  4) Ping all nodes')
+        print('  5) Check available updates (dashboard)')
+        print('  6) Update ONE Ubuntu node')
+        print('  7) Update ALL Ubuntu nodes (disabled for HA safety)')
+        print('  8) Reboot ONE node (control planes blocked)')
+        print('  9) Run Ubuntu prerequisites playbook (legacy filename)')
+        print(' KUBERNETES / DIAGNOSTICS')
+        print(' 10) Kubernetes resources (read-only; Fedora kubeconfig)')
+        print(' 11) Network / disk / logs / security diagnostics')
+        print(' ADMINISTRATION')
+        print(' 12) Inventory & hostname validation')
+        print(' 13) Maintenance history')
+        print(' 14) Help / safety notes')
+        print(' 15) Add Ubuntu host to inventory')
+        print(' 16) MicroK8s HA cluster audit (sudo)')
+        print(' 17) Verify / correct node1 inventory alias')
+        print(' 18) Backup status / last backup log')
+        print(' OPERATIONS / EXISTING')
+        print(' 19) Active alerts + save monitoring snapshot')
+        print(' 20) Safe Kubernetes WORKER maintenance')
+        print(' 21) Backup operations (run, verify, logs)')
+        print(' 22) Kubernetes workloads / events (read-only)')
+        print(' 23) Security baseline audit')
+        print(' 24) Preflight checks')
+        print(' 25) Monitoring history')
+        print(' OBSERVABILITY / HA MONITORING')
+        print(' 26) Kubernetes API and account permissions')
+        print(' 27) Cluster health and actionable findings')
+        print(' 28) Pod restart / unhealthy workload analysis')
+        print(' 29) Certificate expiry and trust overview')
+        print(' 30) Monitoring timer and collection health')
+        print(' 31) SMART / NVMe availability audit')
+        print(' 32) Kubernetes PVC / storage health')
+        print(' 33) Failed systemd services (all nodes)')
+        print(' 34) Kubernetes events and warning summary')
+        print(' 35) Export private JSON infrastructure report')
+        print('  0) Exit')
+        print(' 36) MicroK8s HA membership verification (read-only)')
+        c=input('\nChoose [0-36]: ').strip()
+        if c in ('1','5'):dashboard();pause()
+        elif c=='2':
+            print('Auto refresh every 60 seconds. Press Ctrl+C to return to menu.')
+            try:
+                while True:dashboard();time.sleep(60)
+            except KeyboardInterrupt:print('\nStopped auto-refresh.')
+        elif c=='3':dashboard(details=True);pause()
+        elif c=='4':adhoc('all','ping');pause()
+        elif c=='6':
+            target=target_prompt()
+            if target:
+                ip=inventory_hosts().get(target,{}).get('ansible_host')
+                if ip in CONTROL_IPS:
+                    print('BLOCKED: control-plane upgrades require a separate quorum-aware workflow.')
+                    target=None
+                elif not acc_authorize_worker_target(target):
+                    print('BLOCKED: unknown worker identity; use option 20.')
+                    target=None
+                else:
+                    print('Generic update has no drain. Prefer option 20 for safe worker maintenance.')
+            if target and input(f'Type UPDATE {target}: ').strip()==f'UPDATE {target}':
+                adhoc(target,'ansible.builtin.apt','update_cache=yes upgrade=dist',True,True)
+            else:print('Cancelled.')
+            pause()
+        elif c=='7':
+            print('Disabled: whole-cluster upgrades can remove MicroK8s HA quorum. Use option 20 for workers.')
+            pause()
+        elif c=='8':
+            target=target_prompt()
+            if target:
+                ip=inventory_hosts().get(target,{}).get('ansible_host')
+                if ip in CONTROL_IPS: print('BLOCKED: control-plane reboot requires quorum-aware maintenance.')
+                elif not acc_authorize_worker_target(target):print('BLOCKED: unrecognized worker; inspect inventory.')
+                else:
+                    print('Prefer option 20, which drains workloads and checks Ready state.')
+                    if input(f'Type REBOOT {target} WITHOUT DRAIN: ').strip()==f'REBOOT {target} WITHOUT DRAIN':
+                        adhoc(target,'ansible.builtin.reboot','reboot_timeout=900',True,True)
+            pause()
+        elif c=='9':
+            if PLAYBOOK.exists():run(['ansible-playbook',*BASE,str(PLAYBOOK),'--ask-become-pass'])
+            else:print('Missing playbook:',PLAYBOOK)
+            pause()
+        elif c=='10':kube_menu();pause()
+        elif c=='11':diagnostics();pause()
+        elif c=='12':
+            run(['ansible-inventory','-i',str(INV),'--graph'])
+            dashboard();pause()
+        elif c=='13':show_history();pause()
+        elif c=='14':show_help();pause()
+        elif c=='15':add_inventory_host();pause()
+        elif c=='16':microk8s_audit();pause()
+        elif c=='17':fix_node1_alias();pause()
+        elif c=='18':
+            backup_health()
+            run(['systemctl','status','microk8s-backup.timer','--no-pager'])
+            run(['journalctl','-u','microk8s-backup.service','-n','25','--no-pager'])
+            pause()
+        elif c=='19':alerts_and_snapshot(save=True);pause()
+        elif c=='20':worker_maintenance();pause()
+        elif c=='21':backup_operations();pause()
+        elif c=='22':workload_views();pause()
+        elif c=='23':security_audit();pause()
+        elif c=='24':preflight_report();pause()
+        elif c=='25':history_snapshots();pause()
+        elif c in EXTENDED_MENU:
+            EXTENDED_MENU[c]();pause()
+        elif c=='0':return
+        else:print('Invalid selection.')
+
+if __name__=='__main__':
+    if len(sys.argv)>1 and sys.argv[1]=='--version':
+        print(ACC_VERSION)
+        sys.exit(0)
+    if not INV.exists() or not KEY.exists():
+        sys.exit(f'Missing inventory or key: {INV} / {KEY}')
+    arg=sys.argv[1] if len(sys.argv)>1 else ''
+    try:
+        if arg=='--version':print(ACC_VERSION)
+        elif arg=='--status':command_dashboard()
+        elif arg=='--details':dashboard(details=True)
+        elif arg=='--alerts':alerts_and_snapshot(save=False)
+        elif arg=='--help':show_help()
+        elif arg=='':menu()
+        else:print('Usage: ansible-menu [--status|--details|--alerts|--version|--help]');sys.exit(2)
+    except (KeyboardInterrupt,EOFError):print('\nExiting.')

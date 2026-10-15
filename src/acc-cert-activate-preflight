@@ -1,0 +1,100 @@
+#!/usr/bin/env python3
+"""
+ACC v6.0.1 — Certificate Activation Preflight
+
+Authors:
+    Jeff Swenson
+    ChatGPT Pro / OpenAI GPT-6
+
+Synopsis:
+    Verify production credential layout before certificate activation.
+
+Requirements:
+    Python 3, OpenSSL, existing versioned credentials.
+
+Example:
+    ~/.local/bin/acc-cert-activate-preflight
+
+Version:
+    6.0.1
+
+Changelog:
+    Initial activation preflight.
+
+Logging:
+    Validation status to stdout; no private keys or tokens.
+"""
+import pathlib
+import stat
+import subprocess
+import sys
+
+ROOT = pathlib.Path.home() / ".config/ansible-control-center/token-issuer"
+VERSIONS = ROOT / "versions"
+ROLLBACK = ROOT / "rollback"
+CURRENT = ROOT / "current"
+
+
+def check_dir(path):
+    if path.is_symlink() or not path.is_dir():
+        raise RuntimeError(f"Invalid directory: {path.name}")
+    mode = stat.S_IMODE(path.stat().st_mode)
+    if mode != 0o700:
+        raise RuntimeError(f"Insecure directory permissions: {path.name}")
+    if path.stat().st_uid != __import__("os").getuid():
+        raise RuntimeError(f"Unexpected directory owner: {path.name}")
+
+
+def main():
+    for directory in (ROOT, VERSIONS, ROLLBACK):
+        check_dir(directory)
+
+    if not CURRENT.is_symlink():
+        raise RuntimeError("Active credential selector must be a symlink")
+
+    active = CURRENT.resolve(strict=True)
+
+    if active.parent != VERSIONS.resolve(strict=True):
+        raise RuntimeError("Active version is outside protected storage")
+
+    check_dir(active)
+
+    for filename in ("issuer.key", "issuer.crt"):
+        path = active / filename
+        if path.is_symlink() or not path.is_file():
+            raise RuntimeError(f"Invalid credential: {filename}")
+        if stat.S_IMODE(path.stat().st_mode) != 0o600:
+            raise RuntimeError(f"Insecure credential permissions: {filename}")
+        if path.stat().st_uid != __import__("os").getuid():
+            raise RuntimeError(f"Unexpected credential owner: {filename}")
+
+    subprocess.run(
+        [
+            "openssl", "x509",
+            "-in", str(active / "issuer.crt"),
+            "-checkend", "2592000", "-noout"
+        ],
+        check=True,
+        stdout=subprocess.DEVNULL
+    )
+
+    subprocess.run(
+        [str(pathlib.Path.home() / ".local/bin/acc-k8s-health")],
+        check=True,
+        stdout=subprocess.DEVNULL
+    )
+
+    print("PASS: Credential directories and permissions")
+    print("PASS: Versioned credential selector")
+    print("PASS: Active certificate valid for at least 30 days")
+    print("PASS: Production Kubernetes authentication")
+    print("Active version:", active.name)
+    print("PASS: Activation preflight completed")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as exc:
+        print(f"FAIL: {exc}", file=sys.stderr)
+        sys.exit(1)

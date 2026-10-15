@@ -1,0 +1,30 @@
+{
+  "inventory": "~/ansible/inventory/hosts.ini",
+  "ssh_key": "~/.ssh/ansible_k3s",
+  "management_user": "linuxadmin",
+  "microk8s": {
+    "masters": [
+      "master1",
+      "master2",
+      "master3"
+    ],
+    "workers": [
+      "worker1",
+      "worker2"
+    ],
+    "dqlite_port": 19001,
+    "api_port": 16443
+  },
+  "monitoring": {
+    "ssh_user": "accmonitor",
+    "ssh_key": "~/.ssh/acc_monitor",
+    "collection_interval_seconds": 300
+  },
+  "backups": {
+    "directory": "~/acc-backups/microk8s",
+    "ssh_key": "~/.ssh/microk8s_backup",
+    "ssh_user": "microbackup",
+    "remote_host": "master1",
+    "mount_point": "/mnt/acc-backups"
+  }
+}

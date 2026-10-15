@@ -1,0 +1,14 @@
+#!/bin/sh
+# Ansible Control Center v6.3 TUI launcher
+# Authors: Jeff Swenson and ChatGPT Pro / OpenAI GPT-6
+# Preserves existing v6.2 command-line functions.
+
+if [ "$#" -gt 0 ]; then
+    exec /usr/local/bin/ansible-menu-classic "$@"
+fi
+
+if [ -t 0 ] && [ -t 1 ]; then
+    exec /usr/local/bin/acc-tui
+fi
+
+exec /usr/local/bin/ansible-menu-classic "$@"

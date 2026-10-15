@@ -1,0 +1,25 @@
+---
+- name: Deploy ACC v6.3.1 exporter to node2 only
+  hosts: node2
+  gather_facts: false
+  become: true
+
+  tasks:
+    - name: Back up existing exporter
+      ansible.builtin.copy:
+        src: /usr/local/libexec/acc-monitor-export
+        dest: /usr/local/libexec/acc-monitor-export.pre-v631.bak
+        remote_src: true
+        owner: root
+        group: root
+        mode: '0755'
+        force: false
+
+    - name: Install updated exporter
+      ansible.builtin.copy:
+        src: acc-monitor-export
+        dest: /usr/local/libexec/acc-monitor-export
+        owner: root
+        group: root
+        mode: '0755'
+        backup: true

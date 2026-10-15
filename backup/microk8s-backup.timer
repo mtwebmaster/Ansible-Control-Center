@@ -1,0 +1,8 @@
+[Unit]
+Description=Daily MicroK8s datastore backup at 02:00 Mountain
+[Timer]
+OnCalendar=*-*-* 02:00:00 America/Denver
+Persistent=true
+Unit=microk8s-backup.service
+[Install]
+WantedBy=timers.target

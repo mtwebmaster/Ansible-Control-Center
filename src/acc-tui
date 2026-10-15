@@ -1,0 +1,346 @@
+#!/usr/bin/env python3
+"""
+Ansible Control Center — Advanced Terminal UI
+
+Authors: Jeff Swenson and ChatGPT Pro / OpenAI GPT-6
+Version: 6.3.0-dev4
+Description: Read-only Linux infrastructure monitoring console.
+Requirements: Python 3.14+, curses, sqlite3
+Usage: python3 acc-tui.py
+Logging: Reads existing monitoring SQLite database without modifying it.
+Changelog:
+  6.3.0-dev4 - Collapsible sidebar, node inspector, responsive layout.
+"""
+
+import curses
+import datetime
+import os
+import sqlite3
+from pathlib import Path
+
+VERSION = "6.3.0-dev4"
+DB = Path.home() / ".local/state/ansible-control-center/monitor.sqlite3"
+
+SECTIONS = [
+    "Dashboard",
+    "Nodes & Hardware",
+    "Kubernetes",
+    "Security & HA",
+    "Maintenance",
+    "Backups & Storage",
+    "Events & Logs",
+    "Administration",
+]
+
+CONTROL = {"node1", "node2", "node6"}
+
+
+def read_database():
+    data = {
+        "run": None,
+        "nodes": [],
+        "incidents": [],
+        "error": None,
+    }
+
+    try:
+        if not DB.is_file():
+            raise RuntimeError("Monitoring database unavailable")
+
+        con = sqlite3.connect(
+            f"file:{DB}?mode=ro", uri=True, timeout=2
+        )
+        con.row_factory = sqlite3.Row
+        con.execute("PRAGMA query_only=ON")
+        con.execute("BEGIN")
+
+        run = con.execute(
+            "SELECT ts, hosts_total, hosts_ok, cluster_api, "
+            "collector_error FROM runs ORDER BY rowid DESC LIMIT 1"
+        ).fetchone()
+
+        if run:
+            data["run"] = dict(run)
+            rows = con.execute(
+                "SELECT ts, host, cpu, ram, disk, temp, updates, "
+                "reboot, reachable FROM samples WHERE ts=? ORDER BY host",
+                (run["ts"],),
+            ).fetchall()
+            data["nodes"] = [dict(row) for row in rows]
+
+        rows = con.execute(
+            "SELECT severity, message, status, last_seen "
+            "FROM incidents WHERE UPPER(status)='OPEN' "
+            "ORDER BY last_seen DESC LIMIT 8"
+        ).fetchall()
+
+        data["incidents"] = [dict(row) for row in rows]
+        con.close()
+
+    except (sqlite3.Error, RuntimeError, OSError) as exc:
+        data["error"] = str(exc)
+
+    return data
+
+
+def age_minutes(timestamp):
+    try:
+        ts = datetime.datetime.fromisoformat(timestamp)
+        if ts.tzinfo is None:
+            return None
+        delta = datetime.datetime.now(
+            datetime.timezone.utc
+        ) - ts.astimezone(datetime.timezone.utc)
+        return delta.total_seconds() / 60
+    except (ValueError, TypeError, AttributeError):
+        return None
+
+
+def fmt(value, suffix="", precision=1):
+    if value is None:
+        return "N/A"
+    try:
+        return f"{float(value):.{precision}f}{suffix}"
+    except (ValueError, TypeError):
+        return "N/A"
+
+
+def meter(value, width):
+    width = max(4, width)
+    if value is None:
+        return "[" + "-" * width + "] N/A"
+
+    try:
+        number = max(0.0, min(100.0, float(value)))
+        filled = round(number / 100 * width)
+        return "[" + "#" * filled + "." * (width - filled) + "]"
+    except (ValueError, TypeError):
+        return "[" + "-" * width + "]"
+
+
+def put(win, y, x, message, style=0):
+    h, w = win.getmaxyx()
+    if 0 <= y < h and 0 <= x < w - 1:
+        try:
+            win.addnstr(y, x, str(message), w - x - 1, style)
+        except curses.error:
+            pass
+
+
+def line(win, y, x, width):
+    h, w = win.getmaxyx()
+    if 0 <= y < h and x < w:
+        win.hline(y, x, ord("-"), max(0, min(width, w - x - 1)))
+
+
+def draw(stdscr, section, node_index, sidebar, data):
+    stdscr.erase()
+    h, w = stdscr.getmaxyx()
+
+    if h < 25 or w < 90:
+        put(stdscr, 1, 2, "ACC requires at least 90 columns x 25 rows")
+        put(stdscr, 3, 2, "Resize terminal or press Q to exit")
+        stdscr.refresh()
+        return
+
+    accent = curses.color_pair(1) | curses.A_BOLD
+    highlight = curses.color_pair(2) | curses.A_BOLD
+    muted = curses.color_pair(3)
+
+    put(stdscr, 0, 2, "ACC // INFRASTRUCTURE OPERATIONS", accent)
+    put(stdscr, 0, w - 18, VERSION, muted)
+    line(stdscr, 1, 0, w)
+
+    sidebar_width = 27 if sidebar else 0
+    x = sidebar_width + 3 if sidebar else 3
+    content_width = w - x - 3
+
+    if sidebar:
+        stdscr.vline(2, 27, ord("|"), h - 5)
+        put(stdscr, 3, 2, "SYSTEM NAVIGATION", accent)
+
+        for i, name in enumerate(SECTIONS):
+            style = highlight if i == section else 0
+            put(stdscr, 5 + i * 2, 2, f"{i+1:02d}  {name}", style)
+
+    put(stdscr, 3, x, SECTIONS[section].upper(), accent)
+    line(stdscr, 4, x, content_width)
+
+    run = data.get("run")
+    nodes = data.get("nodes", [])
+    node = nodes[node_index] if node_index < len(nodes) else None
+
+    if data.get("error"):
+        put(stdscr, 6, x, "DATABASE: " + data["error"], curses.A_BOLD)
+
+    elif section in (0, 1):
+        if not run:
+            put(stdscr, 6, x, "No monitoring snapshots available")
+        else:
+            age = age_minutes(run["ts"])
+            fresh = age is not None and -1 <= age <= 15
+            age_str = "UNKNOWN" if age is None else f"{max(0, age):.1f}m"
+
+            put(stdscr, 6, x, "CLUSTER OVERVIEW", accent)
+            put(
+                stdscr, 8, x,
+                f"HOSTS {run['hosts_ok']}/{run['hosts_total']}     "
+                f"API {'YES' if run['cluster_api'] else 'NO'}     "
+                f"OPEN INCIDENTS {len(data['incidents'])}     "
+                f"AGE {age_str}",
+            )
+            put(
+                stdscr, 9, x,
+                "DATA STATUS: RECENT" if fresh else
+                "DATA STATUS: STALE / UNKNOWN",
+                accent if fresh else curses.A_BOLD,
+            )
+
+            if run["collector_error"]:
+                put(stdscr, 10, x, "COLLECTOR: " + str(run["collector_error"]))
+
+            put(stdscr, 12, x, "NODE MONITORING", accent)
+
+            bar_width = max(10, min(30, (content_width - 62) // 2))
+            cpu_col = x + 19
+            ram_col = cpu_col + bar_width + 8
+            disk_col = ram_col + bar_width + 8
+
+            put(stdscr, 14, x, "HOST      STATE")
+            put(stdscr, 14, cpu_col, "CPU")
+            put(stdscr, 14, ram_col, "MEMORY")
+            put(stdscr, 14, disk_col, "DISK   TEMP   UPDATES")
+
+            for i, n in enumerate(nodes):
+                y = 16 + i
+                if y >= h - 15:
+                    break
+
+                style = highlight if i == node_index else 0
+                status = "UP" if n["reachable"] else "DOWN"
+
+                put(stdscr, y, x, f"{n['host']:<10}{status:<6}", style)
+                put(stdscr, y, cpu_col, meter(n["cpu"], bar_width), style)
+                put(stdscr, y, ram_col, meter(n["ram"], bar_width), style)
+
+                put(
+                    stdscr, y, disk_col,
+                    f"{fmt(n['disk'], '%'):<7}"
+                    f"{fmt(n['temp'], 'C', 0):<7}"
+                    f"{n['updates'] if n['updates'] is not None else 'N/A'}",
+                    style,
+                )
+
+            detail_y = max(24, 17 + len(nodes))
+            if detail_y + 9 < h - 3 and node:
+                line(stdscr, detail_y - 2, x, content_width)
+                role = "CONTROL PLANE" if node["host"] in CONTROL else "WORKER"
+
+                put(
+                    stdscr, detail_y, x,
+                    f"NODE INSPECTOR // {node['host']}     ROLE: {role}",
+                    accent,
+                )
+                put(
+                    stdscr, detail_y + 2, x,
+                    f"CPU       {fmt(node['cpu'], '%'):<15}"
+                    f"MEMORY    {fmt(node['ram'], '%')}",
+                )
+                put(
+                    stdscr, detail_y + 3, x,
+                    f"DISK      {fmt(node['disk'], '%'):<15}"
+                    f"TEMP      {fmt(node['temp'], 'C', 0)}",
+                )
+                put(
+                    stdscr, detail_y + 4, x,
+                    f"REACHABLE {'YES' if node['reachable'] else 'NO':<12}"
+                    f"REBOOT    {'YES' if node['reboot'] else 'NO' if node['reboot'] is not None else 'N/A'}",
+                )
+                put(
+                    stdscr, detail_y + 5, x,
+                    f"UPDATES   {node['updates'] if node['updates'] is not None else 'N/A'}",
+                )
+                put(
+                    stdscr, detail_y + 7, x,
+                    f"SAMPLE UTC {node['ts']}", muted,
+                )
+
+    elif section == 6:
+        put(stdscr, 7, x, "CURRENT OPEN INCIDENTS", accent)
+        if not data["incidents"]:
+            put(stdscr, 9, x, "No open incidents in recorded monitoring data")
+        for i, incident in enumerate(data["incidents"]):
+            put(
+                stdscr, 9 + i * 2, x,
+                f"{incident['severity']}: {incident['message']}",
+            )
+
+    else:
+        put(stdscr, 7, x, "Module under development", accent)
+        put(stdscr, 9, x, "ACC v6.2 remains the production operations backend", muted)
+
+    line(stdscr, h - 3, 0, w)
+    put(
+        stdscr, h - 2, 2,
+        "TAB Sidebar   LEFT/RIGHT Section   UP/DOWN Node   "
+        "1-8 Jump   F5 Refresh   Q Exit",
+        accent,
+    )
+    put(
+        stdscr, h - 2, w - 12,
+        datetime.datetime.now().strftime("%H:%M:%S"),
+        muted,
+    )
+    stdscr.refresh()
+
+
+def main(stdscr):
+    curses.curs_set(0)
+    stdscr.keypad(True)
+
+    if curses.has_colors():
+        curses.start_color()
+        try:
+            curses.use_default_colors()
+            bg = -1
+        except curses.error:
+            bg = curses.COLOR_BLACK
+
+        curses.init_pair(1, curses.COLOR_CYAN, bg)
+        curses.init_pair(2, curses.COLOR_BLACK, curses.COLOR_CYAN)
+        curses.init_pair(3, curses.COLOR_WHITE, bg)
+
+    section = 0
+    node_index = 0
+    sidebar = True
+    data = read_database()
+
+    while True:
+        nodes = data.get("nodes", [])
+        node_index = min(node_index, max(0, len(nodes) - 1))
+        draw(stdscr, section, node_index, sidebar, data)
+
+        key = stdscr.getch()
+
+        if key in (ord("q"), ord("Q")):
+            return
+        elif key == 9:
+            sidebar = not sidebar
+        elif key == curses.KEY_RIGHT:
+            section = (section + 1) % len(SECTIONS)
+        elif key == curses.KEY_LEFT:
+            section = (section - 1) % len(SECTIONS)
+        elif key == curses.KEY_DOWN:
+            node_index = min(node_index + 1, max(0, len(nodes) - 1))
+        elif key == curses.KEY_UP:
+            node_index = max(node_index - 1, 0)
+        elif ord("1") <= key <= ord("8"):
+            section = key - ord("1")
+        elif key in (curses.KEY_F5, ord("r"), ord("R")):
+            data = read_database()
+
+
+if __name__ == "__main__":
+    if not os.isatty(0) or not os.isatty(1):
+        raise SystemExit("Interactive terminal required")
+    curses.wrapper(main)

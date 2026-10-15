@@ -1,0 +1,90 @@
+#!/usr/bin/env python3
+"""
+ACC v6.0.1 — Kubernetes Certificate Renewal Preparation
+
+Authors:
+    Jeff Swenson
+    ChatGPT Pro / OpenAI GPT-6
+
+Purpose:
+    Generate staged client credentials for the restricted
+    acc-token-issuer Kubernetes identity.
+
+Requirements:
+    Python 3, OpenSSL, existing ACC credential directory.
+
+Usage:
+    acc-cert-renew-prepare
+
+Version:
+    6.0.1
+
+Security:
+    Creates a new private key only inside a protected staging
+    directory. Never modifies production credentials.
+
+Logging:
+    Prints preparation status. Never prints private keys.
+"""
+
+import os
+import pathlib
+import subprocess
+import sys
+
+ROOT = pathlib.Path.home() / ".config/ansible-control-center/token-issuer"
+STAGING = ROOT / "renewal"
+
+def main():
+    if STAGING.is_symlink():
+        raise RuntimeError("Staging directory must not be a symlink")
+
+    STAGING.mkdir(mode=0o700, parents=True, exist_ok=True)
+    STAGING.chmod(0o700)
+
+    key = STAGING / "issuer-next.key"
+    csr = STAGING / "issuer-next.csr"
+
+    if any(p.exists() or p.is_symlink() for p in (key, csr)):
+        raise RuntimeError(
+            "Staged credentials already exist. Refusing to overwrite."
+        )
+
+    old_umask = os.umask(0o077)
+
+    try:
+        subprocess.run([
+            "openssl", "req",
+            "-new",
+            "-newkey", "rsa:3072",
+            "-nodes",
+            "-keyout", str(key),
+            "-out", str(csr),
+            "-subj", "/CN=acc-token-issuer",
+            "-addext", "keyUsage=critical,digitalSignature",
+            "-addext", "extendedKeyUsage=clientAuth"
+        ], check=True, capture_output=True, text=True)
+
+        key.chmod(0o600)
+        csr.chmod(0o600)
+
+        subprocess.run([
+            "openssl", "req",
+            "-in", str(csr),
+            "-noout", "-verify"
+        ], check=True)
+
+    finally:
+        os.umask(old_umask)
+
+    print("PASS: Renewal credentials prepared.")
+    print("CSR:", csr)
+    print("Private key retained securely in staging.")
+    print("Production credentials unchanged.")
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        sys.exit(1)

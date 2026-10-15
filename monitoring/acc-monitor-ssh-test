@@ -1,0 +1,75 @@
+#!/usr/bin/env python3
+"""
+Ansible Control Center v6.0.1 — Restricted SSH Collector Test
+
+Authors: Jeff Swenson; ChatGPT Pro / OpenAI GPT-6
+Purpose: Validate read-only telemetry collection on all inventory hosts.
+Requirements: Python 3, Ansible, OpenSSH, deployed accmonitor account.
+Logging: Console only; no database changes.
+Version: 6.0.1
+Changelog: Initial restricted monitoring integration test.
+"""
+import json
+import pathlib
+import subprocess
+import sys
+
+HOME = pathlib.Path.home()
+INV = HOME / "ansible/inventory/hosts.ini"
+KEY = HOME / ".ssh/acc_monitor"
+SCHEMA = "acc-monitor-export-v6.0.1"
+
+def command(args, timeout=30):
+    return subprocess.run(
+        args, capture_output=True, text=True,
+        timeout=timeout, check=True
+    ).stdout
+
+def main():
+    inventory = json.loads(command([
+        "ansible-inventory", "-i", str(INV), "--list"
+    ]))
+
+    hostvars = inventory.get("_meta", {}).get("hostvars", {})
+    hosts = command([
+        "ansible", "-i", str(INV), "--list-hosts", "all"
+    ]).splitlines()[1:]
+
+    hosts = [h.strip() for h in hosts if h.strip()]
+    failures = 0
+
+    for host in hosts:
+        address = hostvars.get(host, {}).get("ansible_host", host)
+        print(f"\n=== {host} ({address}) ===")
+
+        try:
+            output = command([
+                "ssh", "-T",
+                "-i", str(KEY),
+                "-o", "IdentitiesOnly=yes",
+                "-o", "BatchMode=yes",
+                "-o", "StrictHostKeyChecking=yes",
+                "-o", "ConnectTimeout=5",
+                f"accmonitor@{address}"
+            ], timeout=15)
+
+            data = json.loads(output)
+
+            if data.get("schema") != SCHEMA:
+                raise ValueError("Unexpected exporter schema")
+
+            if data.get("hostname") != host:
+                raise ValueError("Hostname mismatch")
+
+            print(json.dumps(data, indent=2))
+            print("PASS")
+
+        except Exception as exc:
+            failures += 1
+            print(f"FAIL: {exc}")
+
+    print(f"\nRESULT: {len(hosts)-failures}/{len(hosts)} passed")
+    return 1 if failures else 0
+
+if __name__ == "__main__":
+    sys.exit(main())

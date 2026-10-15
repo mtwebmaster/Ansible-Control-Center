@@ -1,0 +1,30 @@
+---
+- name: Update Ubuntu servers
+  hosts: ubuntu_nodes
+  become: true
+  tasks:
+    - name: Update apt package cache
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Upgrade installed packages
+      ansible.builtin.apt:
+        upgrade: safe
+
+    - name: Remove unused packages
+      ansible.builtin.apt:
+        autoremove: true
+        autoclean: true
+
+    - name: Check if reboot is required
+      ansible.builtin.stat:
+        path: /var/run/reboot-required
+      register: reboot_required
+
+    - name: Report reboot status
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }}:
+          {{ 'REBOOT REQUIRED' if reboot_required.stat.exists
+             else 'No reboot required' }}

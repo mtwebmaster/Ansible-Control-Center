@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -euo pipefail
+FILE=/var/lib/microk8s-export/latest.tar.gz
+case "${SSH_ORIGINAL_COMMAND:-}" in
+ backup) exec sudo -n /usr/local/sbin/microk8s-export-backup ;;
+ fetch) exec /usr/bin/cat "$FILE" ;;
+ sha256) exec /usr/bin/sha256sum "$FILE" ;;
+ *) echo 'Backup key: command not permitted' >&2; exit 126 ;;
+esac

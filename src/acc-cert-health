@@ -1,0 +1,76 @@
+#!/usr/bin/env python3
+"""
+ACC Kubernetes Certificate Health Checker
+Authors: Jeff Swenson | ChatGPT Pro / OpenAI GPT-6
+Version: 6.0.1
+Purpose: Read-only certificate expiration monitoring.
+Logging: JSON stdout; no private keys or tokens exposed.
+"""
+import json
+import pathlib
+import ssl
+import sys
+from datetime import datetime, timezone
+
+ISSUER = (
+    pathlib.Path.home()
+    / ".config/ansible-control-center/token-issuer"
+)
+
+def active_certificate():
+    """Resolve the selected certificate from versioned credentials."""
+    versions = (ISSUER / "versions").resolve(strict=True)
+    selected = (ISSUER / "current").resolve(strict=True)
+
+    if selected.parent != versions:
+        raise RuntimeError("Invalid active credential selector")
+
+    return selected / "issuer.crt"
+
+
+def main():
+    cert_path = active_certificate()
+
+    if not cert_path.is_file():
+        raise FileNotFoundError("Active issuer certificate not found")
+
+    # Python's certificate decoder reads the public certificate only.
+    info = ssl._ssl._test_decode_cert(str(cert_path))
+    expiry = datetime.strptime(
+        info["notAfter"], "%b %d %H:%M:%S %Y %Z"
+    ).replace(tzinfo=timezone.utc)
+
+    remaining = (expiry - datetime.now(timezone.utc)).total_seconds()
+    days = max(0, int(remaining // 86400))
+
+    if remaining <= 0:
+        status = "EXPIRED"
+    elif remaining <= 7 * 86400:
+        status = "CRITICAL"
+    elif remaining <= 30 * 86400:
+        status = "WARNING"
+    else:
+        status = "OK"
+
+    return {
+        "schema": "acc-cert-health-v6.0.1",
+        "certificate": "acc-token-issuer",
+        "expires": expiry.isoformat(),
+        "days_remaining": days,
+        "status": status
+    }
+
+if __name__ == "__main__":
+    try:
+        print(json.dumps(main(), indent=2))
+    except Exception as exc:
+        print(
+            json.dumps({
+                "schema": "acc-cert-health-v6.0.1",
+                "certificate": "acc-token-issuer",
+                "status": "ERROR",
+                "error": type(exc).__name__
+            }),
+            file=sys.stderr
+        )
+        sys.exit(1)

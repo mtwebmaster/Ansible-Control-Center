@@ -1,0 +1,275 @@
+#!/usr/bin/env python3
+"""ACC v6.0: private SQLite telemetry + stateful alerts. Read-only, stdlib only."""
+import argparse, contextlib, datetime as dt, importlib.machinery, importlib.util, json, os, pathlib, sqlite3, subprocess, sys, time
+
+from acc_config import load_config, expand_path
+ROOT = pathlib.Path.home()/'.local/state/ansible-control-center'
+DB = ROOT/'monitor.sqlite3'
+MENU = pathlib.Path('/usr/local/bin/ansible-menu')
+BACKUP = pathlib.Path(expand_path(load_config()['backups']['directory'])) / 'backup-status.json'
+UTC = dt.timezone.utc
+
+def connect():
+    ROOT.mkdir(parents=True,exist_ok=True,mode=0o700)
+    os.chmod(ROOT,0o700)
+    c=sqlite3.connect(DB,timeout=15)
+    c.execute('PRAGMA journal_mode=WAL')
+    c.executescript('''CREATE TABLE IF NOT EXISTS samples(ts TEXT NOT NULL,host TEXT NOT NULL, cpu REAL,ram REAL,disk REAL,temp REAL,updates INTEGER,reboot INTEGER, reachable INTEGER NOT NULL, PRIMARY KEY(ts,host));
+    CREATE TABLE IF NOT EXISTS incidents(id TEXT PRIMARY KEY,severity TEXT NOT NULL,message TEXT NOT NULL,status TEXT NOT NULL,streak INTEGER NOT NULL DEFAULT 0, first_seen TEXT,last_seen TEXT,opened_at TEXT,resolved_at TEXT);
+    CREATE TABLE IF NOT EXISTS events(ts TEXT NOT NULL,incident_id TEXT NOT NULL,action TEXT NOT NULL,severity TEXT,message TEXT);
+    CREATE TABLE IF NOT EXISTS runs(ts TEXT PRIMARY KEY,hosts_total INTEGER,hosts_ok INTEGER,cluster_api INTEGER,collector_error TEXT);''')
+    os.chmod(DB,0o600)
+    return c
+
+def is_num(x): return type(x) in (float,int)
+def issue(result,key,severity,message): result[key]=(severity,message)
+def threshold(issues,host,label,value,warn,critical,unit='%',reverse=False):
+    if not is_num(value):return
+    if value>=critical:issue(issues,f'{host}:{label}','CRITICAL',f'{host} {label} {value}{unit} (critical)')
+    elif value>=warn:issue(issues,f'{host}:{label}','WARNING',f'{host} {label} {value}{unit} (warning)')
+
+def read_backup(issues):
+    try:
+        v=json.loads(BACKUP.read_text()); t=dt.datetime.fromisoformat(v['checked_at']);t=t if t.tzinfo else t.replace(tzinfo=UTC)
+        age=(dt.datetime.now(UTC)-t).total_seconds()/3600
+        if str(v.get('status', '')).lower()!='ok':issue(issues,'backup:failure','CRITICAL','Latest backup reported failure')
+        if age>36:issue(issues,'backup:stale','CRITICAL',f'Backup status {age:.1f}h old')
+        elif age>26:issue(issues,'backup:stale','WARNING',f'Backup status {age:.1f}h old')
+        a=pathlib.Path(v.get('archive') or '')
+        if str(v.get('status', '')).lower()=='ok' and (not a.is_file() or not pathlib.Path(str(a)+'.sha256').is_file()):
+            issue(issues,'backup:missing','CRITICAL','Backup archive or checksum file missing')
+    except Exception as e:issue(issues,'backup:unknown','WARNING',f'Backup status unavailable: {type(e).__name__}')
+    try:
+        stat=os.statvfs('/storage');usage=100*(1-stat.f_bavail/stat.f_blocks)
+        threshold(issues,'fedora','backup-disk',round(usage,1),80,90)
+    except OSError:issue(issues,'backup:disk','WARNING','Cannot check /storage capacity')
+
+def save_issues(c,issues,stamp):
+    known={r[0]:(r[1],r[2],r[3]) for r in c.execute('SELECT id,status,streak,severity FROM incidents')}
+    for key,(severity,msg) in issues.items():
+        prev=known.get(key);streak=(prev[1]+1 if prev and prev[0] in ('open','pending') else 1)
+        # Only open a new incident after two bad samples; critical backup failure is immediate.
+        immediate=key.startswith('backup:failure')
+        status='open' if (prev and prev[0]=='open') or streak>=2 or immediate else 'pending'
+        c.execute('''INSERT INTO incidents(id,severity,message,status,streak,first_seen,last_seen,opened_at,resolved_at)
+                     VALUES (?,?,?,?,?,?,?,?,NULL)
+                     ON CONFLICT(id) DO UPDATE SET severity=excluded.severity,message=excluded.message,status=excluded.status,streak=excluded.streak,last_seen=excluded.last_seen,opened_at=COALESCE(incidents.opened_at,excluded.opened_at),resolved_at=NULL''',
+                  (key,severity,msg,status,streak,stamp,stamp,stamp if status=='open' else None))
+        if status=='open' and (not prev or prev[0]!='open'):
+            c.execute('INSERT INTO events VALUES (?,?,?,?,?)',(stamp,key,'OPEN',severity,msg))
+        elif status=='open' and prev and prev[0]=='open' and prev[2]!=severity:
+            c.execute('INSERT INTO events VALUES (?,?,?,?,?)',(stamp,key,'SEVERITY_CHANGED',severity,msg))
+    for key,(status,streak,sev) in known.items():
+        if key not in issues and status in ('open','pending'):
+            c.execute("UPDATE incidents SET status='resolved',resolved_at=?,streak=0,last_seen=? WHERE id=?",(stamp,stamp,key))
+            if status=='open':c.execute('INSERT INTO events VALUES (?,?,?,?,?)',(stamp,key,'RESOLVED',sev,'Condition cleared'))
+
+def get_live():
+    """Collect telemetry through the restricted accmonitor SSH key."""
+    home = pathlib.Path.home()
+    inventory = home / "ansible/inventory/hosts.ini"
+    key = home / ".ssh/acc_monitor"
+
+    def run(args, timeout=30):
+        return subprocess.run(
+            args, capture_output=True, text=True,
+            timeout=timeout, check=True
+        ).stdout
+
+    inv = json.loads(run([
+        "ansible-inventory", "-i", str(inventory), "--list"
+    ]))
+
+    hosts_output = run([
+        "ansible", "-i", str(inventory),
+        "--list-hosts", "all"
+    ])
+
+    known = [
+        h.strip() for h in hosts_output.splitlines()[1:]
+        if h.strip()
+    ]
+
+    hostvars = inv.get("_meta", {}).get("hostvars", {})
+    results = {}
+
+    for host in known:
+        address = hostvars.get(host, {}).get("ansible_host", host)
+
+        try:
+            output = run([
+                "ssh", "-T",
+                "-i", str(key),
+                "-o", "IdentitiesOnly=yes",
+                "-o", "BatchMode=yes",
+                "-o", "StrictHostKeyChecking=yes",
+                "-o", "ConnectTimeout=5",
+                f"accmonitor@{address}"
+            ], timeout=15)
+
+            data = json.loads(output)
+
+            if data.get("schema") != "acc-monitor-export-v6.0.1":
+                raise ValueError("Unexpected monitoring schema")
+
+            if data.get("hostname") != host:
+                raise ValueError("Hostname mismatch")
+
+            # Preserve validated counts from the restricted exporter.
+            # Older exporters omit this field; retain NULL in that case.
+            value = data.get("updates")
+            data["updates"] = (
+                value if type(value) is int and value >= 0 else None
+            )
+            data["microk8s"] = {}
+            results[host] = data
+
+        except Exception as exc:
+            results[host] = {
+                "error": f"{type(exc).__name__}: {exc}"
+            }
+
+    return known, results
+
+
+def collect_k8s_health():
+    """Read Kubernetes health using restricted certificate authentication."""
+    script = pathlib.Path.home() / ".local/bin/acc-k8s-health"
+    result = subprocess.run(
+        [str(script)],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=True
+    )
+    data = json.loads(result.stdout)
+    if data.get("schema") != "acc-k8s-health-v6.0.1":
+        raise ValueError("Unexpected Kubernetes health schema")
+    required = ("cluster_nodes", "cluster_ready", "pods_total", "pods_healthy")
+    if any(type(data.get(k)) is not int for k in required):
+        raise ValueError("Incomplete Kubernetes health metrics")
+    if data.get("api") != "ok":
+        raise ValueError("Kubernetes API not healthy")
+    return data
+
+
+def once():
+    stamp=dt.datetime.now(UTC).isoformat(timespec='seconds')
+    errors=[];known=[];results={}
+    try:known,results=get_live()
+    except Exception as e:errors.append(f'{type(e).__name__}: {e}')
+    issues={};read_backup(issues)
+
+    # Check dedicated Kubernetes issuer certificate expiration.
+    try:
+        cert_result = subprocess.run(
+            [str(pathlib.Path.home() / ".local/bin/acc-cert-health")],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=True
+        )
+
+        cert = json.loads(cert_result.stdout)
+
+        if cert.get("schema") != "acc-cert-health-v6.0.1":
+            raise ValueError("Unexpected certificate health schema")
+
+        status = cert.get("status")
+        days = cert.get("days_remaining")
+
+        if type(days) is not int:
+            raise ValueError("Invalid certificate expiration value")
+
+        if status in ("EXPIRED", "CRITICAL"):
+            issue(
+                issues,
+                "security:issuer-certificate",
+                "CRITICAL",
+                f"Kubernetes issuer certificate {status}: "
+                f"{days} days remaining"
+            )
+
+        elif status == "WARNING":
+            issue(
+                issues,
+                "security:issuer-certificate",
+                "WARNING",
+                f"Kubernetes issuer certificate expires in {days} days"
+            )
+
+        elif status != "OK":
+            raise ValueError("Unexpected certificate status")
+
+    except Exception as exc:
+        issue(
+            issues,
+            "security:issuer-certificate",
+            "CRITICAL",
+            "Unable to verify Kubernetes issuer certificate: "
+            + type(exc).__name__
+        )
+    if not known:
+        issue(issues,'monitor:collection','CRITICAL','No inventory results (SSH key, inventory, or Ansible access)')
+    api=[]
+    try:
+        k8s = collect_k8s_health()
+        # Separate cluster health from hardware telemetry.
+        api.append(k8s)
+    except Exception as e:
+        errors.append("Kubernetes collection: " + type(e).__name__)
+    for host in known:
+        d=results.get(host,{})
+        if 'error' in d:
+            issue(issues,host+':collection','WARNING',f'{host} Ansible probe failed; not proof host is offline')
+            continue
+        for label,war,crit,unit in [('cpu',80,95,'%'),('ram',85,95,'%'),('disk',80,90,'%'),('temp',75,85,'C')]:
+            threshold(issues,host,label,d.get(label),war,crit,unit)
+        if d.get('hostname') and d.get('hostname')!=host:issue(issues,host+':hostname','WARNING',f'{host} inventory/hostname mismatch')
+        k=d.get('microk8s') or {}
+        if k.get('api')=='ok' and is_num(k.get('cluster_nodes')):api.append(k)
+    if known and not api:issue(issues,'cluster:api','WARNING','No authorized Kubernetes API result')
+    if api:
+        k=max(api,key=lambda x:x.get('cluster_nodes') or 0)
+        if k.get('cluster_ready')!=k.get('cluster_nodes'):issue(issues,'cluster:ready','CRITICAL','One or more Kubernetes nodes NotReady')
+        if k.get('pods_healthy')!=k.get('pods_total'):issue(issues,'cluster:pods','WARNING','One or more Kubernetes pods unhealthy')
+        # HA/dqlite quorum is not established by node/pod readiness alone.
+        # A dedicated datastore quorum probe is required before enabling
+        # authoritative quorum alerts.
+    with connect() as c:
+        for host in known:
+            d=results.get(host,{})
+            c.execute('INSERT OR REPLACE INTO samples VALUES (?,?,?,?,?,?,?,?,?)',
+              (stamp,host,*[d.get(x) if is_num(d.get(x)) else None for x in ('cpu','ram','disk','temp')],
+               d.get('updates') if is_num(d.get('updates')) else None, int(bool(d.get('reboot'))) if 'error' not in d else None,0 if 'error' in d else 1))
+        c.execute('INSERT OR REPLACE INTO runs VALUES (?,?,?,?,?)',
+                  (stamp,len(known),sum('error' not in results.get(x,{}) for x in known),int(bool(api)),'; '.join(errors) or None))
+        save_issues(c,issues,stamp)
+        cutoff=(dt.datetime.now(UTC)-dt.timedelta(days=30)).isoformat(timespec='seconds')
+        c.execute('DELETE FROM samples WHERE ts < ?', (cutoff,))
+        c.execute('DELETE FROM runs WHERE ts < ?', (cutoff,))
+    print(f'Collected {len(known)} nodes, {len(api)} accessible API snapshots; issues detected: {len(issues)}')
+    if errors: print('Errors:', '; '.join(errors))
+    return 0 if known else 2
+
+def status():
+    if not DB.exists():print('No monitoring database. Run: acc-monitor --once');return 1
+    with connect() as c:
+        run=c.execute('SELECT ts,hosts_total,hosts_ok,cluster_api,collector_error FROM runs ORDER BY ts DESC LIMIT 1').fetchone()
+        print('\nACC V6 MONITOR | last collection:',run[0] if run else 'none')
+        if run:print(f'Hosts: {run[2]}/{run[1]} | Kubernetes API: {"yes" if run[3] else "unknown"} | Collector error: {run[4] or "none"}')
+        open_rows=c.execute("SELECT severity,message,streak FROM incidents WHERE status='open' ORDER BY CASE severity WHEN 'CRITICAL' THEN 0 ELSE 1 END,id").fetchall()
+        pending=c.execute("SELECT COUNT(*) FROM incidents WHERE status='pending'").fetchone()[0]
+        print(f'Active incidents: {len(open_rows)} | Pending confirmation: {pending}')
+        for s,m,n in open_rows[:30]:print(f' [{s}] {m} | checks={n}')
+        print('Recent events:')
+        for t,i,a,s,m in c.execute('SELECT * FROM events ORDER BY ts DESC LIMIT 8'):
+            print(f' {t} | {a:<15} | {i}')
+    return 0
+
+def main():
+    p=argparse.ArgumentParser();g=p.add_mutually_exclusive_group(required=True)
+    for key in ('once','status'):g.add_argument('--'+key,action='store_true')
+    a=p.parse_args()
+    return once() if a.once else status()
+if __name__=='__main__':sys.exit(main())

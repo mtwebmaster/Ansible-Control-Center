@@ -1,0 +1,63 @@
+# Secrets and credentials
+*.key
+*.pem
+*.p12
+*.pfx
+*.csr
+*.crt
+*.kubeconfig
+*token*
+!acc-token-issuer-renewal.md
+!acc-cert-renew-prepare
+!acc-cert-renew-validate
+!acc-cert-renew-api-test
+!acc-token-issuer-renewal.md
+id_rsa*
+id_ed25519*
+known_hosts
+vault-password*
+*.vault
+
+# Actual Ansible inventory
+hosts.ini
+hosts.ini.*
+inventory/
+
+# Runtime and generated files
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+*.log
+*.pid
+*.pyc
+__pycache__/
+*.tar
+*.tar.gz
+*.zip
+*.bak
+*.bak-*
+*.backup
+*.swp
+*.tmp
+
+# Python environments
+.venv/
+venv/
+.env
+.env.*
+
+# Public sample inventory is safe to include
+!config/examples/hosts.ini.example
+
+# Do not publish temporary local reviews
+acc-security-scan.txt
+acc-redacted-review.txt
+
+# Private ACC configuration
+config/config.json
+config/local/
+!config/examples/config.json.example
+
+# Private local backups and reviews
+*.before-public-release

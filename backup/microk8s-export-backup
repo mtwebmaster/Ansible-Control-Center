@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+set -euo pipefail
+umask 077
+DIR=/var/lib/microk8s-export
+TMP="$DIR/.backup-$$.tar.gz"
+DEST="$DIR/latest.tar.gz"
+trap 'rm -f -- "$TMP"' EXIT
+/usr/bin/mkdir -p "$DIR"
+/usr/bin/chown root:microbackup "$DIR"
+/usr/bin/chmod 0750 "$DIR"
+/snap/bin/microk8s dbctl backup -o "$TMP" >/dev/null
+/usr/bin/test -s "$TMP"
+/usr/bin/gzip -t "$TMP"
+/usr/bin/chown root:microbackup "$TMP"
+/usr/bin/chmod 0640 "$TMP"
+/usr/bin/mv -f -- "$TMP" "$DEST"

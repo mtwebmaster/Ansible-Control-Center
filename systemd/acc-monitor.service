@@ -1,0 +1,11 @@
+[Unit]
+Description=Ansible Control Center v6 read-only monitor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/acc-monitor --once
+TimeoutStartSec=240
+NoNewPrivileges=true
+UMask=0077

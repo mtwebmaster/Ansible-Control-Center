@@ -1,0 +1,19 @@
+[Unit]
+Description=ACC MicroK8s dqlite Backup
+Wants=network-online.target
+After=network-online.target
+RequiresMountsFor=@BACKUP_MOUNT@
+ConditionPathIsMountPoint=@BACKUP_MOUNT@
+
+[Service]
+Type=oneshot
+User=@SERVICE_USER@
+Group=@SERVICE_GROUP@
+Environment=ACC_CONFIG=@CONFIG_PATH@
+ExecStart=@INSTALL_PREFIX@/bin/acc-backup-daily
+NoNewPrivileges=yes
+PrivateTmp=yes
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

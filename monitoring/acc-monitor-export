@@ -1,0 +1,99 @@
+#!/usr/bin/env python3
+"""Read-only hardware snapshot over forced SSH command. No elevated privileges."""
+import glob
+import json
+import os
+import pathlib
+import socket
+import subprocess
+import time
+
+
+def read(path, default=''):
+    try:
+        return pathlib.Path(path).read_text().strip()
+    except (OSError, ValueError):
+        return default
+
+
+def cpu_ticks():
+    parts = [int(x) for x in read('/proc/stat').splitlines()[0].split()[1:]]
+    return sum(parts), parts[3] + parts[4]
+
+
+def cpu_pct():
+    try:
+        a, idle_a = cpu_ticks()
+        time.sleep(0.15)
+        b, idle_b = cpu_ticks()
+        return round(100 * (1 - (idle_b-idle_a) / (b-a)), 1) if b > a else None
+    except (ValueError, IndexError, ZeroDivisionError):
+        return None
+
+
+def ram_pct():
+    try:
+        vals = {}
+        for line in read('/proc/meminfo').splitlines():
+            k, v = line.split(':', 1)
+            vals[k] = int(v.strip().split()[0])
+        return round(100 * (1 - vals['MemAvailable']/vals['MemTotal']), 1)
+    except (KeyError, ValueError, ZeroDivisionError):
+        return None
+
+
+def temp_c():
+    values = []
+    for p in glob.glob('/sys/class/hwmon/hwmon*/temp*_input') + glob.glob('/sys/class/thermal/thermal_zone*/temp'):
+        try:
+            v = int(read(p)) / 1000
+            if 5 <= v <= 110:
+                values.append(v)
+        except ValueError:
+            continue
+    return round(max(values), 1) if values else None
+
+
+
+def apt_updates():
+    """Count available upgrades using cached APT lists only."""
+    try:
+        result = subprocess.run(
+            ["apt", "list", "--upgradable"],
+            capture_output=True,
+            text=True,
+            timeout=12,
+            check=False,
+            env={
+                "PATH": "/usr/bin:/bin",
+                "LC_ALL": "C",
+            },
+        )
+        if result.returncode != 0:
+            return None
+        return sum(
+            1 for line in result.stdout.splitlines()
+            if "/" in line and not line.startswith("Listing")
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def main():
+    st = os.statvfs('/')
+    used = 100 * (1 - st.f_bavail / st.f_blocks) if st.f_blocks else None
+    uptime = read('/proc/uptime').split()
+    print(json.dumps({
+        'schema': 'acc-monitor-export-v6.0.1',
+        'hostname': socket.gethostname(),
+        'cpu': cpu_pct(),
+        'ram': ram_pct(),
+        'disk': round(used, 1) if used is not None else None,
+        'temp': temp_c(),
+        'uptime_seconds': int(float(uptime[0])) if uptime else None,
+        'reboot': os.path.exists('/var/run/reboot-required'),
+        'updates': apt_updates(),
+    }, separators=(',', ':')))
+
+if __name__ == '__main__':
+    main()

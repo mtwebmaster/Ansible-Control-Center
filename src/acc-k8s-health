@@ -1,0 +1,159 @@
+#!/usr/bin/env python3
+"""
+.SYNOPSIS
+    ACC v6.0.1 restricted Kubernetes health collector.
+
+.DESCRIPTION
+    Requests a short-lived monitoring token using a dedicated
+    X.509 issuer identity. Collects node and pod status over TLS.
+
+.AUTHORS
+    Jeff Swenson
+    ChatGPT Pro / OpenAI GPT-6
+
+.REQUIREMENTS
+    Python 3, Kubernetes CA, issuer certificate/private key,
+    restricted Kubernetes RBAC configuration.
+
+.VERSION
+    6.0.1
+
+.CHANGELOG
+    Initial independent Kubernetes health collection.
+
+.LOGGING
+    JSON to stdout. No tokens or private keys are logged.
+"""
+import json
+import pathlib
+import ssl
+import sys
+import urllib.request
+import urllib.error
+
+ROOT = pathlib.Path.home() / ".config/ansible-control-center"
+ISSUER = ROOT / "token-issuer"
+
+from acc_config import load_config
+from acc_ha_inventory import resolve_voters
+
+ENDPOINTS = list(
+    voter.rsplit(':', 1)[0]
+    for voter in resolve_voters(load_config())
+)
+
+def request(ctx, url, token=None, body=None):
+    headers = {"Accept": "application/json"}
+    if token:
+        headers["Authorization"] = "Bearer " + token
+    if body is not None:
+        headers["Content-Type"] = "application/json"
+
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(body).encode() if body is not None else None,
+        headers=headers,
+        method="POST" if body is not None else "GET"
+    )
+    with urllib.request.urlopen(req, context=ctx, timeout=10) as r:
+        return json.load(r)
+
+def main():
+    ca = ROOT / "certs/kubernetes-ca.crt"
+
+    issuer_ctx = ssl.create_default_context(cafile=str(ca))
+    # Resolve both credentials from one immutable version directory.
+    credential_dir = (ISSUER / "current").resolve(strict=True)
+    versions_dir = (ISSUER / "versions").resolve(strict=True)
+
+    if credential_dir.parent != versions_dir:
+        raise RuntimeError("Invalid active credential selector")
+
+    issuer_ctx.load_cert_chain(
+        str(credential_dir / "issuer.crt"),
+        str(credential_dir / "issuer.key")
+    )
+    api_ctx = ssl.create_default_context(cafile=str(ca))
+
+    errors = []
+
+    for ip in ENDPOINTS:
+        api = f"https://{ip}:16443"
+
+        try:
+            issued = request(
+                issuer_ctx,
+                api + "/api/v1/namespaces/acc-monitoring/"
+                      "serviceaccounts/acc-k8s-monitor/token",
+                body={
+                    "apiVersion": "authentication.k8s.io/v1",
+                    "kind": "TokenRequest",
+                    "spec": {"expirationSeconds": 600}
+                }
+            )
+
+            token = issued["status"]["token"]
+
+            nodes = request(api_ctx, api + "/api/v1/nodes", token)
+            pods = request(api_ctx, api + "/api/v1/pods", token)
+
+            node_items = nodes["items"]
+            pod_items = pods["items"]
+
+            ready = sum(
+                any(
+                    c.get("type") == "Ready"
+                    and c.get("status") == "True"
+                    for c in n.get("status", {}).get("conditions", [])
+                )
+                for n in node_items
+            )
+
+            healthy_pods = sum(
+                p.get("status", {}).get("phase") == "Running"
+                and all(
+                    c.get("ready", False)
+                    for c in p.get("status", {}).get("containerStatuses", [])
+                )
+                and bool(
+                    p.get("status", {}).get("containerStatuses", [])
+                )
+                or (
+                    p.get("status", {}).get("phase") == "Succeeded"
+                )
+                for p in pod_items
+            )
+
+            return {
+                "schema": "acc-k8s-health-v6.0.1",
+                "api_endpoint": ip,
+                "cluster_nodes": len(node_items),
+                "cluster_ready": ready,
+                "pods_total": len(pod_items),
+                "pods_healthy": healthy_pods,
+                "api": "ok"
+            }
+
+        except (
+            urllib.error.URLError,
+            TimeoutError,
+            OSError,
+            ValueError,
+            KeyError
+        ) as exc:
+            errors.append(f"{ip}: {type(exc).__name__}")
+
+    raise RuntimeError(
+        "No authenticated Kubernetes API endpoint succeeded: "
+        + "; ".join(errors)
+    )
+
+if __name__ == "__main__":
+    try:
+        print(json.dumps(main(), indent=2))
+    except Exception as exc:
+        print(
+            f"ACC Kubernetes collection failed: {exc}",
+            file=sys.stderr
+        )
+        sys.exit(1)

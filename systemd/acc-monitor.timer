@@ -1,0 +1,12 @@
+[Unit]
+Description=Collect Ansible Control Center telemetry every 5 minutes
+
+[Timer]
+OnStartupSec=2min
+OnActiveSec=1min
+OnUnitInactiveSec=5min
+AccuracySec=30s
+Unit=acc-monitor.service
+
+[Install]
+WantedBy=timers.target

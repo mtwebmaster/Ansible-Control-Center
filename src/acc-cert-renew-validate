@@ -1,0 +1,92 @@
+#!/usr/bin/env python3
+"""
+ACC v6.0.1 — Staged Certificate Validation
+
+Authors: Jeff Swenson | ChatGPT Pro / OpenAI GPT-6
+Purpose: Validate replacement Kubernetes issuer credentials.
+Requirements: Python 3, OpenSSL, Kubernetes CA certificate.
+Usage: acc-cert-renew-validate
+Version: 6.0.1
+Logging: Validation results only; no private-key disclosure.
+Changelog: Initial staged-certificate validator.
+"""
+import pathlib
+import subprocess
+import sys
+import os
+
+BASE = pathlib.Path.home() / ".config/ansible-control-center"
+STAGE = BASE / "token-issuer/renewal"
+CA = BASE / "certs/kubernetes-ca.crt"
+KEY = STAGE / "issuer-next.key"
+CERT = STAGE / "issuer-next.crt"
+
+def openssl(*args):
+    return subprocess.check_output(
+        ["openssl", *map(str, args)],
+        text=True,
+        stderr=subprocess.PIPE
+    ).strip()
+
+def main():
+    for p in (STAGE, KEY, CERT, CA):
+        if p.is_symlink():
+            raise RuntimeError(f"Symlink not permitted: {p.name}")
+
+    for p in (KEY, CERT, CA):
+        if not p.is_file():
+            raise RuntimeError(f"Missing required file: {p.name}")
+
+    if STAGE.stat().st_mode & 0o077:
+        raise RuntimeError("Staging directory permissions too broad")
+
+    if KEY.stat().st_mode & 0o077:
+        raise RuntimeError("Staged private key permissions too broad")
+
+    subject = openssl(
+        "x509", "-in", CERT, "-noout",
+        "-subject", "-nameopt", "RFC2253"
+    )
+    if subject != "subject=CN=acc-token-issuer":
+        raise RuntimeError(f"Unexpected certificate identity: {subject}")
+    print("PASS: Restricted certificate identity")
+
+    openssl(
+        "verify", "-CAfile", CA,
+        "-purpose", "sslclient", CERT
+    )
+    print("PASS: Certificate chain and client-authentication purpose")
+
+    openssl(
+        "x509", "-in", CERT,
+        "-checkend", "2592000", "-noout"
+    )
+    print("PASS: Certificate valid for at least 30 additional days")
+
+    key_public = subprocess.check_output([
+        "openssl", "pkey", "-in", str(KEY),
+        "-pubout", "-outform", "DER"
+    ], stderr=subprocess.PIPE)
+
+    cert_public = subprocess.check_output([
+        "openssl", "x509", "-in", str(CERT),
+        "-pubkey", "-noout"
+    ], stderr=subprocess.PIPE)
+
+    cert_public_der = subprocess.check_output([
+        "openssl", "pkey", "-pubin", "-outform", "DER"
+    ], input=cert_public, stderr=subprocess.PIPE)
+
+    if key_public != cert_public_der:
+        raise RuntimeError("Certificate and private key mismatch")
+    print("PASS: Certificate matches staged private key")
+
+    print("PASS: Staged credentials validated")
+    print("Production credentials unchanged")
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as exc:
+        print(f"FAIL: {exc}", file=sys.stderr)
+        sys.exit(1)

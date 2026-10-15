@@ -1,0 +1,68 @@
+---
+- name: Install restricted MicroK8s backup endpoint
+  hosts: node1
+  gather_facts: false
+  become: true
+  vars:
+    backup_pubkey: "{{ lookup('file', lookup('env','HOME') + '/.ssh/microk8s_backup.pub') }}"
+  tasks:
+    - name: Create dedicated backup account
+      ansible.builtin.user:
+        name: microbackup
+        shell: /bin/bash
+        create_home: true
+        password_lock: true
+        state: present
+    - name: Look up the microbackup account
+      ansible.builtin.getent:
+        database: passwd
+        key: microbackup
+
+    - name: Set microbackup home directory
+      ansible.builtin.set_fact:
+        backup_account_home: "{{ getent_passwd['microbackup'][4] }}"
+
+    - name: Create restricted SSH directory
+      ansible.builtin.file:
+        path: "{{ backup_account_home }}/.ssh"
+        state: directory
+        owner: microbackup
+        group: microbackup
+        mode: '0700'
+    - name: Install backup exporter
+      ansible.builtin.copy:
+        src: microk8s-export-backup
+        dest: /usr/local/sbin/microk8s-export-backup
+        owner: root
+        group: root
+        mode: '0755'
+    - name: Install SSH command gate
+      ansible.builtin.copy:
+        src: microk8s-backup-gate
+        dest: /usr/local/sbin/microk8s-backup-gate
+        owner: root
+        group: root
+        mode: '0755'
+    - name: Create root-controlled export directory
+      ansible.builtin.file:
+        path: /var/lib/microk8s-export
+        state: directory
+        owner: root
+        group: microbackup
+        mode: '0750'
+    - name: Permit only the fixed backup exporter via sudo
+      ansible.builtin.copy:
+        dest: /etc/sudoers.d/90-microbackup
+        content: |
+          microbackup ALL=(root) NOPASSWD: /usr/local/sbin/microk8s-export-backup
+        owner: root
+        group: root
+        mode: '0440'
+        validate: '/usr/sbin/visudo -cf %s'
+    - name: Install command-restricted authorized key
+      ansible.builtin.copy:
+        dest: "{{ backup_account_home }}/.ssh/authorized_keys"
+        content: "restrict,command=\"/usr/local/sbin/microk8s-backup-gate\" {{ backup_pubkey }}\n"
+        owner: microbackup
+        group: microbackup
+        mode: '0600'

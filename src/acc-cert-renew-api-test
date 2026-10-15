@@ -1,0 +1,136 @@
+#!/usr/bin/env python3
+"""
+ACC v6.0.1 — Staged Kubernetes Certificate API Test
+
+Authors: Jeff Swenson | ChatGPT Pro / OpenAI GPT-6
+Synopsis: Verify staged issuer authentication and restricted permissions.
+Requirements: Python 3, Kubernetes CA, staged certificate and key.
+Example: acc-cert-renew-api-test
+Version: 6.0.1
+Changelog: Initial staged certificate authorization tester.
+Logging: Status only. Tokens and private keys are never printed.
+"""
+import json
+import pathlib
+import ssl
+import sys
+import urllib.error
+import urllib.request
+
+ROOT = pathlib.Path.home() / ".config/ansible-control-center"
+STAGE = ROOT / "token-issuer/renewal"
+CA = ROOT / "certs/kubernetes-ca.crt"
+
+from acc_config import load_config
+from acc_ha_inventory import resolve_voters
+
+API_ENDPOINTS = tuple(
+    voter.rsplit(':', 1)[0]
+    for voter in resolve_voters(load_config())
+)
+
+def verify_denied(ctx, url, body=None):
+    """Require Kubernetes to deny an unauthorized operation."""
+    headers = {"Content-Type": "application/json"}
+
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(body).encode() if body else None,
+        headers=headers,
+        method="POST" if body else "GET"
+    )
+
+    try:
+        with urllib.request.urlopen(
+            request, context=ctx, timeout=15
+        ) as response:
+            raise RuntimeError(
+                f"Unexpected authorization: HTTP {response.status}"
+            )
+    except urllib.error.HTTPError as exc:
+        if exc.code != 403:
+            raise RuntimeError(
+                f"Expected HTTP 403, received {exc.code}"
+            ) from None
+
+def main():
+    key = STAGE / "issuer-next.key"
+    cert = STAGE / "issuer-next.crt"
+
+    for path in (STAGE, key, cert, CA):
+        if path.is_symlink():
+            raise RuntimeError("Symlink not permitted: " + path.name)
+
+    if not key.is_file() or not cert.is_file():
+        raise RuntimeError("Staged certificate or key missing")
+
+    ctx = ssl.create_default_context(cafile=str(CA))
+    ctx.load_cert_chain(certfile=str(cert), keyfile=str(key))
+
+    for ip in API_ENDPOINTS:
+        url = (
+            f"https://{ip}:16443/api/v1/namespaces/"
+            "acc-monitoring/serviceaccounts/acc-k8s-monitor/token"
+        )
+
+        body = json.dumps({
+            "apiVersion": "authentication.k8s.io/v1",
+            "kind": "TokenRequest",
+            "spec": {"expirationSeconds": 600}
+        }).encode()
+
+        request = urllib.request.Request(
+            url,
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST"
+        )
+
+        try:
+            with urllib.request.urlopen(
+                request, context=ctx, timeout=15
+            ) as response:
+                result = json.load(response)
+
+            if not result.get("status", {}).get("token"):
+                raise RuntimeError("TokenRequest returned no token")
+
+            verify_denied(
+                ctx,
+                f"https://{ip}:16443/api/v1/nodes"
+            )
+            print("PASS: Direct node listing denied")
+
+            verify_denied(
+                ctx,
+                f"https://{ip}:16443/api/v1/namespaces/"
+                "acc-monitoring/serviceaccounts/default/token",
+                body={
+                    "apiVersion": "authentication.k8s.io/v1",
+                    "kind": "TokenRequest",
+                    "spec": {"expirationSeconds": 600}
+                }
+            )
+            print("PASS: Unrelated service-account token denied")
+
+            print("PASS: Restricted token issuance via", ip)
+            print("PASS: Staged issuer authentication verified")
+            print("Production credentials unchanged")
+            return
+
+        except urllib.error.HTTPError as exc:
+            # Authorization failures should not be hidden by HA failover.
+            raise RuntimeError(
+                f"Kubernetes API denied staged certificate: HTTP {exc.code}"
+            ) from None
+        except (urllib.error.URLError, TimeoutError, OSError):
+            continue
+
+    raise RuntimeError("No Kubernetes API endpoint available")
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as exc:
+        print(f"FAIL: {exc}", file=sys.stderr)
+        sys.exit(1)
