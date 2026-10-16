@@ -1,0 +1,237 @@
+#!/usr/bin/env python3
+"""
+ACC v6 — MicroK8s Backup Health Collector
+Authors: Jeff Swenson and ChatGPT Pro / OpenAI GPT-6
+Purpose: Read-only backup integrity and retention reporting.
+Requires: Python 3.14+ and existing ACC configuration.
+Usage: python3 monitoring/acc-backup-health
+"""
+
+import datetime as dt
+import hashlib
+import json
+import pathlib
+import re
+import sys
+import tarfile
+
+sys.path.insert(
+    0, str(pathlib.Path(__file__).resolve().parents[1] / "src")
+)
+
+from acc_config import load_config, expand_path
+
+UTC = dt.timezone.utc
+NAME_RE = re.compile(r"microk8s-\d{8}T\d{6}Z\.tar\.gz\Z")
+PAIR_RE = re.compile(r"(\d+)\.(data|key)\Z")
+
+
+def inspect():
+    root = pathlib.Path(
+        expand_path(load_config()["backups"]["directory"])
+    ).resolve()
+
+    result = {
+        "schema": "acc-backup-health-v1",
+        "health": "OK",
+        "archive": None,
+        "backup_age_hours": None,
+        "archive_bytes": None,
+        "sha256_valid": False,
+        "archive_format_valid": False,
+        "datastore_pairs": 0,
+        "daily": 0,
+        "weekly": 0,
+        "monthly": 0,
+        "warnings": [],
+        "critical": [],
+    }
+
+    # Count archives without modifying retention.
+    for category, folder in (
+        ("daily", "dqlite"),
+        ("weekly", "weekly"),
+        ("monthly", "monthly"),
+    ):
+        directory = root / folder
+        result[category] = sum(
+            p.is_file() and NAME_RE.fullmatch(p.name) is not None
+            for p in directory.glob("microk8s-*.tar.gz")
+        )
+
+    state = json.loads(
+        (root / "backup-status.json").read_text()
+    )
+
+    if state.get("status") != "ok":
+        result["critical"].append(
+            "Latest backup status is not OK"
+        )
+
+    timestamp = dt.datetime.fromisoformat(
+        state["checked_at"]
+    )
+
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.replace(tzinfo=UTC)
+
+    age = (
+        dt.datetime.now(UTC) - timestamp
+    ).total_seconds() / 3600
+
+    result["backup_age_hours"] = round(age, 2)
+
+    if age < -0.1:
+        result["warnings"].append(
+            "Backup status timestamp is in the future"
+        )
+    elif age > 36:
+        result["critical"].append(
+            f"Backup is {age:.1f} hours old"
+        )
+    elif age > 26:
+        result["warnings"].append(
+            f"Backup is {age:.1f} hours old"
+        )
+
+    archive = pathlib.Path(
+        state.get("archive") or ""
+    )
+
+    result["archive"] = str(archive)
+
+    allowed = (root / "dqlite").resolve()
+
+    if (
+        not archive.is_absolute()
+        or archive.resolve().parent != allowed
+        or not NAME_RE.fullmatch(archive.name)
+        or not archive.is_file()
+    ):
+        result["critical"].append(
+            "Status points to a missing or unexpected archive"
+        )
+    else:
+        result["archive_bytes"] = archive.stat().st_size
+
+        # Independently verify archive SHA-256.
+        try:
+            sidecar = pathlib.Path(
+                str(archive) + ".sha256"
+            )
+
+            parts = sidecar.read_text().strip().split(
+                maxsplit=1
+            )
+
+            if (
+                len(parts) != 2
+                or not re.fullmatch(r"[0-9a-f]{64}", parts[0])
+                or parts[1].lstrip(" *") != archive.name
+            ):
+                raise ValueError(
+                    "Invalid checksum sidecar"
+                )
+
+            digest = hashlib.sha256()
+
+            with archive.open("rb") as stream:
+                for block in iter(
+                    lambda: stream.read(1024 * 1024), b""
+                ):
+                    digest.update(block)
+
+            result["sha256_valid"] = (
+                digest.hexdigest() == parts[0]
+            )
+
+            if not result["sha256_valid"]:
+                result["critical"].append(
+                    "Backup SHA-256 mismatch"
+                )
+
+        except (OSError, ValueError) as exc:
+            result["critical"].append(
+                f"Checksum verification failed: {exc}"
+            )
+
+        # Verify the expected datastore directory
+        # and paired data/key entries.
+        try:
+            prefix = archive.name[:-7] + "/"
+            data, keys = set(), set()
+
+            with tarfile.open(archive, "r:gz") as tf:
+                for member in tf:
+                    if (
+                        member.isdir()
+                        and member.name.rstrip("/")
+                        == prefix.rstrip("/")
+                    ):
+                        continue
+
+                    if (
+                        not member.isfile()
+                        or member.size <= 0
+                        or not member.name.startswith(prefix)
+                    ):
+                        raise ValueError(
+                            "Unexpected archive entry"
+                        )
+
+                    match = PAIR_RE.fullmatch(
+                        member.name[len(prefix):]
+                    )
+
+                    if match is None:
+                        raise ValueError(
+                            "Unexpected datastore entry"
+                        )
+
+                    if match[2] == "data":
+                        data.add(match[1])
+                    else:
+                        keys.add(match[1])
+
+            if not data or data != keys:
+                raise ValueError(
+                    "Incomplete datastore data/key pairs"
+                )
+
+            result["archive_format_valid"] = True
+            result["datastore_pairs"] = len(data)
+
+        except (
+            OSError, ValueError, tarfile.TarError
+        ) as exc:
+            result["critical"].append(
+                f"Archive structure invalid: {exc}"
+            )
+
+    if result["critical"]:
+        result["health"] = "CRITICAL"
+    elif result["warnings"]:
+        result["health"] = "WARNING"
+
+    return result
+
+
+def main():
+    try:
+        result = inspect()
+    except Exception as exc:
+        result = {
+            "schema": "acc-backup-health-v1",
+            "health": "CRITICAL",
+            "critical": [
+                "Backup health collection unavailable: "
+                f"{type(exc).__name__}: {exc}"
+            ],
+        }
+
+    print(json.dumps(result, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

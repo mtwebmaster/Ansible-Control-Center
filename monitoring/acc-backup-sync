@@ -1,0 +1,130 @@
+#!/usr/bin/env python3
+"""
+Ansible Control Center — Backup Health SQLite Integration
+
+Authors: Jeff Swenson and ChatGPT Pro / OpenAI GPT-6
+Version: 1.0.0
+Synopsis: Store validated MicroK8s backup health in ACC SQLite.
+Description: Runs the read-only backup health collector and records
+             its JSON result in a separate monitoring table.
+Requirements: Python 3.14+, acc-backup-health, valid ACC config.
+Example: acc-backup-sync --config CONFIG --db DATABASE
+Logging: Prints the collector result; errors go to stderr.
+Changelog: 1.0.0 - Initial backup health history integration.
+"""
+
+import argparse
+import contextlib
+import datetime as dt
+import json
+import os
+from pathlib import Path
+import sqlite3
+import subprocess
+import sys
+
+UTC = dt.timezone.utc
+COLLECTOR = Path(__file__).resolve().with_name("acc-backup-health")
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS backup_health_samples (
+    collected_at TEXT PRIMARY KEY,
+    health TEXT NOT NULL,
+    archive TEXT,
+    backup_age_hours REAL,
+    archive_bytes INTEGER,
+    sha256_valid INTEGER NOT NULL,
+    archive_format_valid INTEGER NOT NULL,
+    datastore_pairs INTEGER NOT NULL,
+    daily INTEGER NOT NULL,
+    weekly INTEGER NOT NULL,
+    monthly INTEGER NOT NULL,
+    warnings_json TEXT NOT NULL,
+    critical_json TEXT NOT NULL
+);
+"""
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", required=True, type=Path)
+    parser.add_argument("--db", required=True, type=Path)
+    args = parser.parse_args()
+
+    config = args.config.expanduser().resolve()
+    database = args.db.expanduser().resolve()
+
+    if not config.is_file():
+        parser.error("ACC configuration file does not exist")
+
+    if not database.is_file():
+        parser.error("Existing ACC monitoring database required")
+
+    env = os.environ.copy()
+    env["ACC_CONFIG"] = str(config)
+
+    process = subprocess.run(
+        [sys.executable, str(COLLECTOR)],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=60,
+        env=env,
+    )
+
+    health = json.loads(process.stdout)
+
+    if health.get("schema") != "acc-backup-health-v1":
+        raise ValueError("Unexpected backup health schema")
+
+    if health.get("health") not in ("OK", "WARNING", "CRITICAL"):
+        raise ValueError("Invalid backup health state")
+
+    stamp = dt.datetime.now(UTC).isoformat(timespec="seconds")
+    cutoff = (
+        dt.datetime.now(UTC) - dt.timedelta(days=30)
+    ).isoformat(timespec="seconds")
+
+    record = (
+        stamp,
+        health["health"],
+        health.get("archive"),
+        health.get("backup_age_hours"),
+        health.get("archive_bytes"),
+        int(health.get("sha256_valid") is True),
+        int(health.get("archive_format_valid") is True),
+        int(health.get("datastore_pairs", 0)),
+        int(health.get("daily", 0)),
+        int(health.get("weekly", 0)),
+        int(health.get("monthly", 0)),
+        json.dumps(health.get("warnings", [])),
+        json.dumps(health.get("critical", [])),
+    )
+
+    with contextlib.closing(
+        sqlite3.connect(database, timeout=15)
+    ) as connection:
+        with connection:
+            connection.executescript(SCHEMA)
+            connection.execute(
+                """
+                INSERT OR REPLACE INTO backup_health_samples
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                record,
+            )
+            connection.execute(
+                "DELETE FROM backup_health_samples "
+                "WHERE collected_at < ?",
+                (cutoff,),
+            )
+
+    print(
+        f"PASS: Backup health stored | "
+        f"status={health['health']} | "
+        f"archive={health.get('archive')}"
+    )
+
+
+if __name__ == "__main__":
+    main()
